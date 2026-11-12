@@ -543,3 +543,203 @@ app.get('/api/admin/telemetry', verifyToken, authorize('admin'), async (req, res
 });
 
 app.listen(PORT, () => console.log(`Secure Healthcare Backend running at http://localhost:${PORT}`));
+
+// --- AUTO-INITIALIZE AIVEN DEFAULTDB TABLES & 1 DEMO ACCOUNT PER ROLE ---
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(191) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        role ENUM('patient', 'doctor', 'admin') NOT NULL DEFAULT 'patient',
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS patients (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL UNIQUE,
+        full_name VARCHAR(150) NOT NULL,
+        date_of_birth DATE NOT NULL,
+        gender ENUM('male', 'female', 'other') NOT NULL,
+        blood_group ENUM('A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-') NOT NULL,
+        phone VARCHAR(20) NOT NULL,
+        address TEXT,
+        allergies TEXT,
+        chronic_conditions TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS emergency_contacts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        patient_id INT NOT NULL,
+        contact_name VARCHAR(150) NOT NULL,
+        relationship VARCHAR(50) NOT NULL,
+        phone_number VARCHAR(20) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS doctors (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL UNIQUE,
+        full_name VARCHAR(150) NOT NULL,
+        specialization VARCHAR(100) NOT NULL,
+        license_number VARCHAR(100) NOT NULL UNIQUE,
+        hospital_affiliation VARCHAR(150) NOT NULL,
+        phone VARCHAR(20) NOT NULL,
+        area VARCHAR(120) DEFAULT 'Bengaluru',
+        latitude DECIMAL(10, 6) DEFAULT 12.971600,
+        longitude DECIMAL(10, 6) DEFAULT 77.594600,
+        consultation_radius_km INT DEFAULT 15,
+        consultation_fee VARCHAR(30) DEFAULT '₹700',
+        bio TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS appointments (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        patient_id INT NOT NULL,
+        doctor_id INT NOT NULL,
+        appointment_date DATE NOT NULL,
+        appointment_time TIME NOT NULL,
+        reason TEXT NOT NULL,
+        status ENUM('pending', 'confirmed', 'completed', 'cancelled') DEFAULT 'pending',
+        consultation_notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE,
+        FOREIGN KEY (doctor_id) REFERENCES doctors(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS medical_records (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        patient_id INT NOT NULL,
+        doctor_id INT NOT NULL,
+        appointment_id INT NULL,
+        record_date DATE NOT NULL,
+        diagnosis VARCHAR(255) NOT NULL,
+        symptoms TEXT NOT NULL,
+        clinical_notes TEXT NOT NULL,
+        treatment_plan TEXT NOT NULL,
+        follow_up_date DATE NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE,
+        FOREIGN KEY (doctor_id) REFERENCES doctors(id) ON DELETE CASCADE,
+        FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON DELETE SET NULL
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS prescriptions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        medical_record_id INT NULL,
+        patient_id INT NOT NULL,
+        doctor_id INT NOT NULL,
+        prescribed_date DATE NOT NULL,
+        status ENUM('active', 'completed', 'discontinued') DEFAULT 'active',
+        instructions TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (medical_record_id) REFERENCES medical_records(id) ON DELETE SET NULL,
+        FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE,
+        FOREIGN KEY (doctor_id) REFERENCES doctors(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS prescription_items (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        prescription_id INT NOT NULL,
+        medicine_name VARCHAR(150) NOT NULL,
+        dosage VARCHAR(50) NOT NULL,
+        frequency VARCHAR(50) NOT NULL,
+        duration VARCHAR(50) NOT NULL,
+        special_notes VARCHAR(255),
+        FOREIGN KEY (prescription_id) REFERENCES prescriptions(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS lab_reports (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        patient_id INT NOT NULL,
+        doctor_id INT NULL,
+        test_name VARCHAR(150) NOT NULL,
+        test_type VARCHAR(100) NOT NULL,
+        test_date DATE NOT NULL,
+        laboratory_name VARCHAR(150) NOT NULL,
+        result_summary TEXT NOT NULL,
+        document_url VARCHAR(255) NOT NULL,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE,
+        FOREIGN KEY (doctor_id) REFERENCES doctors(id) ON DELETE SET NULL
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        title VARCHAR(150) NOT NULL,
+        message TEXT NOT NULL,
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        action VARCHAR(100) NOT NULL,
+        entity_affected VARCHAR(100) NOT NULL,
+        record_id INT NOT NULL,
+        ip_address VARCHAR(45) NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB
+    `);
+
+    const [[{ cnt }]] = await pool.query('SELECT COUNT(*) AS cnt FROM users');
+    if (cnt === 0) {
+      const adminPass = await bcrypt.hash('Admin@2026', 10);
+      const doctorPass = await bcrypt.hash('Doctor@2026', 10);
+      const patientPass = await bcrypt.hash('Patient@2026', 10);
+
+      await pool.execute(
+        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, "admin", TRUE)',
+        ['admin@uhrhospital.in', adminPass]
+      );
+
+      const [docUser] = await pool.execute(
+        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, "doctor", TRUE)',
+        ['doctor@uhrhospital.in', doctorPass]
+      );
+      await pool.execute(
+        `INSERT INTO doctors (user_id, full_name, specialization, license_number, hospital_affiliation, phone, area, latitude, longitude, consultation_radius_km, consultation_fee)
+         VALUES (?, 'Dr. Ananya Rao', 'General Physician & Cardiologist', 'KMC-2026-412', 'UHR Multispeciality Hospital', '+91 80 4123 4567', 'Hebbal, Bengaluru', 13.0358, 77.5970, 20, '₹700')`,
+        [docUser.insertId]
+      );
+
+      const [patUser] = await pool.execute(
+        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, "patient", TRUE)',
+        ['patient@uhrhospital.in', patientPass]
+      );
+      await pool.execute(
+        `INSERT INTO patients (user_id, full_name, date_of_birth, gender, blood_group, phone, address, allergies)
+         VALUES (?, 'Rahul Verma', '1999-04-18', 'male', 'O+', '+91 98765 43210', 'Hebbal, Bengaluru, Karnataka', 'Penicillin')`,
+        [patUser.insertId]
+      );
+      console.log('Initialized defaultdb with 1 Admin, 1 Doctor, and 1 Patient.');
+    }
+  } catch (err) {
+    console.error('Auto-init DB error:', err.message);
+  }
+})();
