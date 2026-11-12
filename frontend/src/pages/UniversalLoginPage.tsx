@@ -24,11 +24,22 @@ import confetti from 'canvas-confetti';
 
 const API_BASE = 'https://unified-health-record.onrender.com';
 
+async function fetchWithWakeRetry(url: string, options?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, options);
+  } catch {
+    // Render free tier cold-start wake-up retry after 6 seconds
+    await new Promise(r => setTimeout(r, 6000));
+    return await fetch(url, options);
+  }
+}
+
 export const UniversalLoginPage: React.FC = () => {
   const { setActiveRole, setIsAuthenticated, setCurrentUser } = useHealthRecord();
   const [mode, setMode] = useState<'login' | 'verify-2fa' | 'register' | 'setup-admin'>('login');
   const [role, setRole] = useState<'patient' | 'doctor' | 'admin'>('patient');
   const [hasAdmin, setHasAdmin] = useState<boolean>(true);
+  const [serverStatus, setServerStatus] = useState<'waking' | 'online'>('waking');
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -50,9 +61,10 @@ export const UniversalLoginPage: React.FC = () => {
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/health`)
+    fetchWithWakeRetry(`${API_BASE}/api/health`)
       .then(r => r.json())
       .then(d => {
+        setServerStatus('online');
         if (typeof d.hasAdmin === 'boolean') setHasAdmin(d.hasAdmin);
       })
       .catch(() => {});
@@ -82,12 +94,13 @@ export const UniversalLoginPage: React.FC = () => {
     }
     setSendingOtp(true);
     try {
-      const res = await fetch(`${API_BASE}/api/auth/request-register-otp`, {
+      const res = await fetchWithWakeRetry(`${API_BASE}/api/auth/request-register-otp`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email })
       });
       const data = await res.json();
+      setServerStatus('online');
       if (!res.ok) {
         setError(data.message || 'Could not send verification code.');
       } else {
@@ -95,7 +108,7 @@ export const UniversalLoginPage: React.FC = () => {
         setSuccessMsg(data.message);
       }
     } catch {
-      setError('Server unreachable. Wait 30 seconds if Render was waking up and try again.');
+      setError('Backend is still starting up on Render. Wait 15 seconds and click Send OTP again.');
     } finally {
       setSendingOtp(false);
     }
@@ -109,7 +122,7 @@ export const UniversalLoginPage: React.FC = () => {
 
     try {
       if (mode === 'register' || mode === 'setup-admin') {
-        const res = await fetch(`${API_BASE}/api/auth/register`, {
+        const res = await fetchWithWakeRetry(`${API_BASE}/api/auth/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -143,7 +156,7 @@ export const UniversalLoginPage: React.FC = () => {
       }
 
       if (mode === 'login') {
-        const response = await fetch(`${API_BASE}/api/auth/login`, {
+        const response = await fetchWithWakeRetry(`${API_BASE}/api/auth/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, password, expectedRole: role })
@@ -164,7 +177,7 @@ export const UniversalLoginPage: React.FC = () => {
       }
 
       if (mode === 'verify-2fa') {
-        const response = await fetch(`${API_BASE}/api/auth/verify-2fa`, {
+        const response = await fetchWithWakeRetry(`${API_BASE}/api/auth/verify-2fa`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, otp: otpCode, expectedRole: role })
@@ -183,7 +196,7 @@ export const UniversalLoginPage: React.FC = () => {
         confetti({ particleCount: 75, spread: 80, origin: { y: 0.6 } });
       }
     } catch {
-      setError('Unable to reach server. Please wait 30 seconds and try again.');
+      setError('Backend is still waking up on Render. Wait 15 seconds and click Submit again.');
     } finally {
       setLoading(false);
     }
@@ -209,9 +222,18 @@ export const UniversalLoginPage: React.FC = () => {
 
         <div className="bg-slate-900/90 backdrop-blur-xl border border-slate-800 rounded-3xl p-7 shadow-2xl space-y-5">
           <div className="space-y-1.5">
-            <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-              Select Portal Role
-            </label>
+            <div className="flex justify-between items-center">
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                Select Portal Role
+              </label>
+              <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full ${
+                serverStatus === 'online'
+                  ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
+                  : 'bg-amber-950 text-amber-300 border border-amber-800'
+              }`}>
+                {serverStatus === 'online' ? '● Server Online' : '◌ Connecting Server...'}
+              </span>
+            </div>
             <div className="grid grid-cols-3 gap-2 bg-slate-950 p-1 rounded-xl border border-slate-800">
               <button
                 type="button"
@@ -368,8 +390,8 @@ export const UniversalLoginPage: React.FC = () => {
                   <label className="block text-slate-400 uppercase font-bold mb-1">
                     Real Email ID (No Fake or Duplicate IDs) *
                   </label>
-                  <div className="flex gap-2">
-                    <div className="relative flex-1">
+                  <div className="space-y-2">
+                    <div className="relative w-full">
                       <Mail className="w-4 h-4 text-slate-500 absolute left-3 top-3" />
                       <input
                         type="email"
@@ -388,10 +410,10 @@ export const UniversalLoginPage: React.FC = () => {
                         type="button"
                         onClick={handleRequestRegistrationOtp}
                         disabled={sendingOtp}
-                        className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl font-bold flex items-center gap-1 shrink-0 disabled:opacity-50"
+                        className="w-full py-2 px-3 bg-cyan-600/20 hover:bg-cyan-600/30 border border-cyan-500/40 text-cyan-300 rounded-xl font-bold flex items-center justify-center gap-1.5 disabled:opacity-50"
                       >
                         <Send className="w-3.5 h-3.5" />
-                        <span>{sendingOtp ? 'Sending...' : otpSent ? 'Resend OTP' : 'Send OTP'}</span>
+                        <span>{sendingOtp ? 'Sending Verification Code...' : otpSent ? 'Resend 6-Digit Email OTP' : 'Send 6-Digit Verification OTP to Email'}</span>
                       </button>
                     )}
                   </div>

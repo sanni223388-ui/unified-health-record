@@ -3,10 +3,11 @@ const cors = require('cors');
 const path = require('path');
 const dns = require('dns').promises;
 const crypto = require('crypto');
+const tls = require('tls');
+const net = require('net');
 const dotenv = require('dotenv');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
 const pool = require('./config/db');
 
 dotenv.config();
@@ -19,7 +20,7 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// --- REAL EMAIL VALIDATION & SMTP TRANSPORTER ---
+// --- REAL EMAIL VALIDATION (ANTI-FAKE, ANTI-DUPLICATE, LIVE DNS MX CHECK) ---
 const BLOCKED_DOMAINS = new Set([
   'example.com', 'example.org', 'example.net', 'test.com', 'fake.com',
   'mailinator.com', 'tempmail.com', '10minutemail.com', 'guerrillamail.com',
@@ -31,58 +32,130 @@ async function isRealDeliverableEmail(rawEmail) {
   const email = (rawEmail || '').trim().toLowerCase();
   const basicRegex = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/;
   if (!basicRegex.test(email)) {
-    return { valid: false, reason: 'Invalid email format. Enter a real email address.' };
+    return { valid: false, reason: 'Enter a valid email format (e.g., name@gmail.com).' };
   }
   const domain = email.split('@')[1];
   if (BLOCKED_DOMAINS.has(domain)) {
-    return { valid: false, reason: `Disposable or demo domain "@${domain}" is blocked. Use a real personal or hospital email.` };
+    return { valid: false, reason: `Fake or disposable domain "@${domain}" is blocked.` };
   }
   try {
     const mxRecords = await dns.resolveMx(domain);
     if (!mxRecords || mxRecords.length === 0) {
-      return { valid: false, reason: `Email domain "@${domain}" has no active mail servers.` };
+      return { valid: false, reason: `Domain "@${domain}" cannot receive emails (no MX record).` };
     }
     return { valid: true, email };
   } catch {
-    return { valid: false, reason: `Email domain "@${domain}" does not exist or cannot receive emails.` };
+    return { valid: false, reason: `Email domain "@${domain}" does not exist.` };
   }
 }
 
-const mailTransporter = process.env.SMTP_USER && process.env.SMTP_PASS
-  ? nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
+// --- ZERO-DEPENDENCY TLS SMTP CLIENT FOR GMAIL (NO NODEMAILER CRASHES) ---
+function sendGmailSmtp(toEmail, subject, htmlBody) {
+  return new Promise((resolve, reject) => {
+    const smtpUser = (process.env.SMTP_USER || '').trim();
+    const smtpPass = (process.env.SMTP_PASS || '').replace(/\s+/g, '');
+    if (!smtpUser || !smtpPass) {
+      return reject(new Error('Set SMTP_USER and SMTP_PASS in Render Environment Variables to send 2FA emails.'));
+    }
+
+    const socket = tls.connect(465, 'smtp.gmail.com', { servername: 'smtp.gmail.com' }, () => {});
+    socket.setTimeout(12000);
+
+    let step = 0;
+    let buffer = '';
+
+    const sendCmd = (cmd) => {
+      socket.write(cmd + '\r\n');
+    };
+
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString();
+      if (!buffer.endsWith('\r\n')) return;
+      const lines = buffer.trim().split('\r\n');
+      const lastLine = lines[lines.length - 1];
+      if (lastLine[3] === '-') return; // multiline response still incoming
+      const code = parseInt(lastLine.slice(0, 3), 10);
+      buffer = '';
+
+      if (step === 0 && code === 220) {
+        step = 1;
+        sendCmd('EHLO unifiedhealth.app');
+      } else if (step === 1 && code === 250) {
+        step = 2;
+        sendCmd('AUTH LOGIN');
+      } else if (step === 2 && code === 334) {
+        step = 3;
+        sendCmd(Buffer.from(smtpUser).toString('base64'));
+      } else if (step === 3 && code === 334) {
+        step = 4;
+        sendCmd(Buffer.from(smtpPass).toString('base64'));
+      } else if (step === 4) {
+        if (code !== 235) {
+          socket.destroy();
+          return reject(new Error('Gmail SMTP authentication failed. Check SMTP_USER and 16-char App Password in Render.'));
+        }
+        step = 5;
+        sendCmd(`MAIL FROM:<${smtpUser}>`);
+      } else if (step === 5 && code === 250) {
+        step = 6;
+        sendCmd(`RCPT TO:<${toEmail}>`);
+      } else if (step === 6 && code === 250) {
+        step = 7;
+        sendCmd('DATA');
+      } else if (step === 7 && code === 354) {
+        step = 8;
+        const msg = [
+          `From: "Unified Health Security" <${smtpUser}>`,
+          `To: <${toEmail}>`,
+          `Subject: ${subject}`,
+          'MIME-Version: 1.0',
+          'Content-Type: text/html; charset=UTF-8',
+          '',
+          htmlBody,
+          '.'
+        ].join('\r\n');
+        sendCmd(msg);
+      } else if (step === 8 && code === 250) {
+        step = 9;
+        sendCmd('QUIT');
+        socket.end();
+        resolve(true);
+      } else if (code >= 400) {
+        socket.destroy();
+        reject(new Error(`SMTP Error (${code}): ${lastLine}`));
       }
-    })
-  : null;
+    });
+
+    socket.on('timeout', () => {
+      socket.destroy();
+      reject(new Error('Email server connection timed out.'));
+    });
+
+    socket.on('error', (err) => {
+      reject(new Error(`Email delivery failed: ${err.message}`));
+    });
+  });
+}
 
 async function sendSecurityOtpEmail(toEmail, otpCode, purposeLabel) {
-  if (!mailTransporter) {
-    throw new Error('Email OTP service is not configured on server (set SMTP_USER and SMTP_PASS in Render Environment).');
-  }
-  await mailTransporter.sendMail({
-    from: `"Unified Health Security" <${process.env.SMTP_USER}>`,
-    to: toEmail,
-    subject: `${otpCode} is your Unified Health ${purposeLabel} Verification Code`,
-    html: `
-      <div style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px;">
-        <h2 style="color: #0d9488; margin-top: 0;">Unified Health Record • 2-Step Verification</h2>
-        <p style="color: #334155; font-size: 14px;">Use the 6-digit security code below to complete your <strong>${purposeLabel}</strong>:</p>
-        <div style="background: #f1f5f9; padding: 16px; text-align: center; border-radius: 8px; font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #0f172a;">
-          ${otpCode}
-        </div>
-        <p style="color: #64748b; font-size: 12px; margin-top: 16px;">This code expires in 10 minutes. If you did not request this, someone may have entered your password—do not share this code.</p>
+  const subject = `${otpCode} is your Unified Health ${purposeLabel} Code`;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px;">
+      <h2 style="color: #0d9488; margin-top: 0;">Unified Health Record • 2-Step Verification</h2>
+      <p style="color: #334155; font-size: 14px;">Enter this 6-digit security code to complete your <strong>${purposeLabel}</strong>:</p>
+      <div style="background: #f1f5f9; padding: 16px; text-align: center; border-radius: 8px; font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #0f172a;">
+        ${otpCode}
       </div>
-    `
-  });
+      <p style="color: #64748b; font-size: 12px; margin-top: 16px;">Expires in 10 minutes. Never share this code with anyone.</p>
+    </div>
+  `;
+  await sendGmailSmtp(toEmail, subject, html);
 }
 
 const verifyToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ message: 'Unauthorized: Missing authentication token.' });
+    return res.status(401).json({ message: 'Unauthorized: Missing token.' });
   }
   try {
     req.user = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
@@ -114,13 +187,17 @@ const logAudit = async (userId, action, entity, recordId) => {
 app.get('/api/health', async (req, res) => {
   try {
     const [[{ adminCount }]] = await pool.query('SELECT COUNT(*) AS adminCount FROM users WHERE role = ?', ['admin']);
-    res.json({ status: 'ok', hasAdmin: adminCount > 0, email2faConfigured: Boolean(mailTransporter) });
+    res.json({
+      status: 'ok',
+      hasAdmin: adminCount > 0,
+      email2faConfigured: Boolean(process.env.SMTP_USER && process.env.SMTP_PASS)
+    });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-// --- STEP 1 OF REGISTRATION: SEND EMAIL VERIFICATION OTP ---
+// --- STEP 1 OF REGISTRATION: SEND EMAIL OTP ---
 app.post('/api/auth/request-register-otp', async (req, res) => {
   const { email } = req.body;
   const check = await isRealDeliverableEmail(email);
@@ -149,7 +226,7 @@ app.post('/api/auth/request-register-otp', async (req, res) => {
   }
 });
 
-// --- STEP 2 OF REGISTRATION: VERIFY OTP & CREATE REAL PATIENT (OR FIRST ADMIN) ---
+// --- STEP 2 OF REGISTRATION: VERIFY OTP & CREATE ACCOUNT ---
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, otp, accountType, fullName, dob, gender, bloodGroup, phone, address, allergies } = req.body;
   const check = await isRealDeliverableEmail(email);
@@ -177,13 +254,13 @@ app.post('/api/auth/register', async (req, res) => {
     );
     if (otpRows.length === 0) {
       await conn.rollback();
-      return res.status(400).json({ message: 'Verification code expired or not requested. Request a new code.' });
+      return res.status(400).json({ message: 'Verification code expired or not requested. Click Send OTP first.' });
     }
 
     const otpValid = await bcrypt.compare(otp.trim(), otpRows[0].otp_hash);
     if (!otpValid) {
       await conn.rollback();
-      return res.status(401).json({ message: 'Invalid 6-digit verification code.' });
+      return res.status(401).json({ message: 'Incorrect 6-digit verification code.' });
     }
 
     let roleToCreate = 'patient';
@@ -191,7 +268,7 @@ app.post('/api/auth/register', async (req, res) => {
       const [[{ adminCount }]] = await conn.execute('SELECT COUNT(*) AS adminCount FROM users WHERE role = ?', ['admin']);
       if (adminCount > 0) {
         await conn.rollback();
-        return res.status(403).json({ message: 'Hospital Admin already exists. Additional admins cannot self-register.' });
+        return res.status(403).json({ message: 'Primary Hospital Admin already exists.' });
       }
       roleToCreate = 'admin';
     }
@@ -229,7 +306,7 @@ app.post('/api/auth/register', async (req, res) => {
     await logAudit(userId, `VERIFIED_REGISTER_${roleToCreate.toUpperCase()}`, 'users', userId);
 
     res.status(201).json({
-      message: `${roleToCreate === 'admin' ? 'Hospital Admin' : 'Patient'} account verified and created! Sign in with 2-Step Verification.`
+      message: `${roleToCreate === 'admin' ? 'Hospital Admin' : 'Patient'} account verified and created! Sign in now.`
     });
   } catch (err) {
     await conn.rollback();
@@ -239,7 +316,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// --- STEP 1 OF LOGIN: VERIFY PASSWORD & SEND 2FA OTP CODE ---
+// --- STEP 1 OF LOGIN: VERIFY PASSWORD & SEND 2FA OTP ---
 app.post('/api/auth/login', async (req, res) => {
   const { email, password, expectedRole } = req.body;
   const cleanEmail = (email || '').trim().toLowerCase();
@@ -292,7 +369,7 @@ app.post('/api/auth/verify-2fa', async (req, res) => {
       [cleanEmail, 'login_2fa']
     );
     if (otpRows.length === 0) {
-      return res.status(400).json({ message: '2FA code expired. Please sign in again to request a new code.' });
+      return res.status(400).json({ message: '2FA code expired. Please sign in again.' });
     }
 
     if (otpRows[0].attempts >= 5) {
@@ -352,7 +429,7 @@ app.post('/api/auth/verify-2fa', async (req, res) => {
   }
 });
 
-// --- PATIENT ROUTES (STRICTLY ISOLATED) ---
+// --- PATIENT DASHBOARD ---
 app.get('/api/patient/dashboard', verifyToken, authorize('patient'), async (req, res) => {
   const patientId = req.user.patientId;
   try {
@@ -516,7 +593,7 @@ app.post('/api/doctor/patients', verifyToken, authorize('doctor', 'admin'), asyn
     await conn.commit();
     await logAudit(req.user.id, 'DOCTOR_CREATED_PATIENT', 'patients', patRes.insertId);
     res.status(201).json({
-      message: `Patient ${fullName} registered (${check.email}). They will use 2-Step Email OTP on login.`,
+      message: `Patient ${fullName} registered (${check.email}).`,
       patient: { id: patRes.insertId, fullName, email: check.email }
     });
   } catch (err) {
@@ -632,7 +709,7 @@ app.post('/api/doctor/consultation', verifyToken, authorize('doctor'), async (re
   }
 });
 
-// --- REAL DOCTORS DIRECTORY ---
+// --- DOCTORS DIRECTORY ---
 app.get('/api/doctors', async (req, res) => {
   try {
     const [docs] = await pool.execute(
@@ -709,7 +786,7 @@ app.post('/api/admin/doctors', verifyToken, authorize('admin'), async (req, res)
 
     await conn.commit();
     await logAudit(req.user.id, `ADMIN_CREATED_DOCTOR_${licenseNumber}`, 'doctors', docRes.insertId);
-    res.status(201).json({ message: `Doctor ${fullName} (${check.email}) registered. They will sign in using 2-Step Email OTP.` });
+    res.status(201).json({ message: `Doctor ${fullName} (${check.email}) registered.` });
   } catch (err) {
     await conn.rollback();
     res.status(500).json({ message: err.message });
@@ -741,7 +818,7 @@ app.get('/api/admin/telemetry', verifyToken, authorize('admin'), async (req, res
   }
 });
 
-// --- INITIALIZE PRODUCTION TABLES (ZERO DEMO ACCOUNTS) ---
+// --- AUTO-INITIALIZE PRODUCTION TABLES ---
 (async () => {
   try {
     await pool.query(`
@@ -917,7 +994,7 @@ app.get('/api/admin/telemetry', verifyToken, authorize('admin'), async (req, res
     `);
 
     await pool.execute('DELETE FROM users WHERE email LIKE ? OR email LIKE ?', ['%@example.com', '%@uhrhospital.in']);
-    console.log('✅ Production schema ready (zero demo accounts, 2FA + DNS MX email validation active).');
+    console.log('✅ Production schema ready (zero dependencies, 2FA + DNS MX active).');
   } catch (err) {
     console.error('DB init error:', err.message);
   }
