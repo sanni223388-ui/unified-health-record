@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useHealthRecord } from '../context/HealthRecordContext';
 import {
   Activity,
@@ -16,7 +16,9 @@ import {
   UserPlus,
   User,
   Phone,
-  MapPin
+  MapPin,
+  KeyRound,
+  Send
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
@@ -24,15 +26,16 @@ const API_BASE = 'https://unified-health-record.onrender.com';
 
 export const UniversalLoginPage: React.FC = () => {
   const { setActiveRole, setIsAuthenticated, setCurrentUser } = useHealthRecord();
-  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [mode, setMode] = useState<'login' | 'verify-2fa' | 'register' | 'setup-admin'>('login');
   const [role, setRole] = useState<'patient' | 'doctor' | 'admin'>('patient');
+  const [hasAdmin, setHasAdmin] = useState<boolean>(true);
 
-  // Login states
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [otpCode, setOtpCode] = useState('');
+  const [otpSent, setOtpSent] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
 
-  // Patient self-registration states
   const [fullName, setFullName] = useState('');
   const [dob, setDob] = useState('1998-01-01');
   const [gender, setGender] = useState('male');
@@ -42,20 +45,60 @@ export const UniversalLoginPage: React.FC = () => {
   const [allergies, setAllergies] = useState('');
 
   const [loading, setLoading] = useState(false);
+  const [sendingOtp, setSendingOtp] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
+  useEffect(() => {
+    fetch(`${API_BASE}/api/health`)
+      .then(r => r.json())
+      .then(d => {
+        if (typeof d.hasAdmin === 'boolean') setHasAdmin(d.hasAdmin);
+      })
+      .catch(() => {});
+  }, []);
+
   const roleDescriptions = {
-    patient: 'View your personal medical reports, prescriptions & book nearby doctors',
-    doctor: 'Register patients, verify patient email IDs & issue clinical records',
-    admin: 'Add real hospital doctors, configure clinic radius & monitor audit logs'
+    patient: '2FA-protected personal medical reports, prescriptions & real doctor booking',
+    doctor: '2FA-protected clinical ward: verify patient emails & commit medical records',
+    admin: '2FA-protected hospital governance: register real doctors & view audit logs'
   };
 
   const handleRoleSelect = (selectedRole: 'patient' | 'doctor' | 'admin') => {
     setRole(selectedRole);
     setMode('login');
+    setOtpCode('');
+    setOtpSent(false);
     setError(null);
     setSuccessMsg(null);
+  };
+
+  const handleRequestRegistrationOtp = async () => {
+    setError(null);
+    setSuccessMsg(null);
+    if (!email.trim()) {
+      setError('Enter your real email ID first to receive the 6-digit verification code.');
+      return;
+    }
+    setSendingOtp(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/request-register-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.message || 'Could not send verification code.');
+      } else {
+        setOtpSent(true);
+        setSuccessMsg(data.message);
+      }
+    } catch {
+      setError('Server unreachable. Wait 30 seconds if Render was waking up and try again.');
+    } finally {
+      setSendingOtp(false);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -65,14 +108,16 @@ export const UniversalLoginPage: React.FC = () => {
     setSuccessMsg(null);
 
     try {
-      if (mode === 'register') {
+      if (mode === 'register' || mode === 'setup-admin') {
         const res = await fetch(`${API_BASE}/api/auth/register`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            accountType: mode === 'setup-admin' ? 'admin' : 'patient',
             fullName,
             email,
             password,
+            otp: otpCode,
             dob,
             gender,
             bloodGroup,
@@ -83,38 +128,62 @@ export const UniversalLoginPage: React.FC = () => {
         });
         const data = await res.json();
         if (!res.ok) {
-          setError(data.message || 'Registration failed.');
+          setError(data.message || 'Verification failed.');
           setLoading(false);
           return;
         }
-        setSuccessMsg('Patient account created! Please sign in with your email and password.');
+        if (mode === 'setup-admin') setHasAdmin(true);
+        setSuccessMsg(data.message);
         setMode('login');
         setPassword('');
+        setOtpCode('');
+        setOtpSent(false);
         setLoading(false);
         return;
       }
 
-      const response = await fetch(`${API_BASE}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password, expectedRole: role })
-      });
-
-      const data = await response.json();
-      if (!response.ok) {
-        setError(data.message || 'Invalid credentials.');
-        setLoading(false);
-        return;
+      if (mode === 'login') {
+        const response = await fetch(`${API_BASE}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password, expectedRole: role })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          setError(data.message || 'Authentication failed.');
+          setLoading(false);
+          return;
+        }
+        if (data.requires2FA) {
+          setMode('verify-2fa');
+          setOtpCode('');
+          setSuccessMsg(data.message);
+          setLoading(false);
+          return;
+        }
       }
 
-      localStorage.setItem('uhr_jwt_token', data.token);
-      localStorage.setItem('uhr_user', JSON.stringify(data.user));
-      setCurrentUser(data.user);
-      setActiveRole(data.user.role);
-      setIsAuthenticated(true);
-      confetti({ particleCount: 75, spread: 80, origin: { y: 0.6 } });
+      if (mode === 'verify-2fa') {
+        const response = await fetch(`${API_BASE}/api/auth/verify-2fa`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, otp: otpCode, expectedRole: role })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          setError(data.message || 'Invalid 2FA code.');
+          setLoading(false);
+          return;
+        }
+        localStorage.setItem('uhr_jwt_token', data.token);
+        localStorage.setItem('uhr_user', JSON.stringify(data.user));
+        setCurrentUser(data.user);
+        setActiveRole(data.user.role);
+        setIsAuthenticated(true);
+        confetti({ particleCount: 75, spread: 80, origin: { y: 0.6 } });
+      }
     } catch {
-      setError('Unable to reach server. If Render free tier was sleeping, wait 30 seconds and try again.');
+      setError('Unable to reach server. Please wait 30 seconds and try again.');
     } finally {
       setLoading(false);
     }
@@ -134,12 +203,11 @@ export const UniversalLoginPage: React.FC = () => {
             Unified<span className="text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-teal-300">Health</span>
           </h1>
           <p className="text-[11px] text-cyan-400/80 font-mono tracking-widest uppercase mt-0.5 font-bold">
-            Hospital Clinical Record & Appointment Network
+            2-Step Verified Hospital Clinical Network
           </p>
         </div>
 
         <div className="bg-slate-900/90 backdrop-blur-xl border border-slate-800 rounded-3xl p-7 shadow-2xl space-y-5">
-          {/* Role Chooser */}
           <div className="space-y-1.5">
             <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
               Select Portal Role
@@ -204,10 +272,36 @@ export const UniversalLoginPage: React.FC = () => {
           )}
 
           <form onSubmit={handleSubmit} className="space-y-3.5 text-xs">
+            {mode === 'verify-2fa' && (
+              <div className="space-y-3">
+                <div className="p-3 rounded-xl bg-cyan-950/40 border border-cyan-500/30 text-cyan-200 text-[11px]">
+                  2-Step Verification active for <strong className="font-mono">{email}</strong>. Even with your password, login is blocked without this email OTP.
+                </div>
+                <div>
+                  <label className="block text-slate-400 uppercase font-bold mb-1">
+                    Enter 6-Digit 2FA Code
+                  </label>
+                  <div className="relative">
+                    <KeyRound className="w-4 h-4 text-cyan-400 absolute left-3 top-3" />
+                    <input
+                      type="text"
+                      required
+                      maxLength={6}
+                      pattern="\d{6}"
+                      value={otpCode}
+                      onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, ''))}
+                      className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-cyan-500/50 rounded-xl text-white font-mono text-base tracking-[0.4em] outline-none"
+                      placeholder="000000"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+
             {mode === 'register' && (
               <>
                 <div>
-                  <label className="block text-slate-400 uppercase font-bold mb-1">Full Name</label>
+                  <label className="block text-slate-400 uppercase font-bold mb-1">Full Name *</label>
                   <div className="relative">
                     <User className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
                     <input
@@ -216,7 +310,7 @@ export const UniversalLoginPage: React.FC = () => {
                       value={fullName}
                       onChange={(e) => setFullName(e.target.value)}
                       className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white outline-none focus:border-cyan-500"
-                      placeholder="Enter patient full name"
+                      placeholder="Enter real full name"
                     />
                   </div>
                 </div>
@@ -224,20 +318,11 @@ export const UniversalLoginPage: React.FC = () => {
                 <div className="grid grid-cols-3 gap-2">
                   <div>
                     <label className="block text-slate-400 uppercase font-bold mb-1 text-[10px]">DOB</label>
-                    <input
-                      type="date"
-                      value={dob}
-                      onChange={(e) => setDob(e.target.value)}
-                      className="w-full px-2 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white"
-                    />
+                    <input type="date" value={dob} onChange={(e) => setDob(e.target.value)} className="w-full px-2 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white" />
                   </div>
                   <div>
                     <label className="block text-slate-400 uppercase font-bold mb-1 text-[10px]">Gender</label>
-                    <select
-                      value={gender}
-                      onChange={(e) => setGender(e.target.value)}
-                      className="w-full px-2 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white"
-                    >
+                    <select value={gender} onChange={(e) => setGender(e.target.value)} className="w-full px-2 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white">
                       <option value="male">Male</option>
                       <option value="female">Female</option>
                       <option value="other">Other</option>
@@ -245,11 +330,7 @@ export const UniversalLoginPage: React.FC = () => {
                   </div>
                   <div>
                     <label className="block text-slate-400 uppercase font-bold mb-1 text-[10px]">Blood</label>
-                    <select
-                      value={bloodGroup}
-                      onChange={(e) => setBloodGroup(e.target.value)}
-                      className="w-full px-2 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white"
-                    >
+                    <select value={bloodGroup} onChange={(e) => setBloodGroup(e.target.value)} className="w-full px-2 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white">
                       {['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'].map((bg) => (
                         <option key={bg} value={bg}>{bg}</option>
                       ))}
@@ -259,87 +340,110 @@ export const UniversalLoginPage: React.FC = () => {
 
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="block text-slate-400 uppercase font-bold mb-1 text-[10px]">Phone</label>
+                    <label className="block text-slate-400 uppercase font-bold mb-1 text-[10px]">Phone *</label>
                     <div className="relative">
                       <Phone className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-2.5" />
-                      <input
-                        type="text"
-                        required
-                        value={phone}
-                        onChange={(e) => setPhone(e.target.value)}
-                        className="w-full pl-8 pr-2 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white"
-                        placeholder="+91 98765..."
-                      />
+                      <input type="text" required value={phone} onChange={(e) => setPhone(e.target.value)} className="w-full pl-8 pr-2 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white" placeholder="+91 98..." />
                     </div>
                   </div>
                   <div>
                     <label className="block text-slate-400 uppercase font-bold mb-1 text-[10px]">City / Area</label>
                     <div className="relative">
                       <MapPin className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-2.5" />
-                      <input
-                        type="text"
-                        value={address}
-                        onChange={(e) => setAddress(e.target.value)}
-                        className="w-full pl-8 pr-2 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white"
-                        placeholder="Bengaluru"
-                      />
+                      <input type="text" value={address} onChange={(e) => setAddress(e.target.value)} className="w-full pl-8 pr-2 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white" placeholder="Bengaluru" />
                     </div>
                   </div>
                 </div>
 
                 <div>
                   <label className="block text-slate-400 uppercase font-bold mb-1 text-[10px]">Known Allergies (Optional)</label>
-                  <input
-                    type="text"
-                    value={allergies}
-                    onChange={(e) => setAllergies(e.target.value)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white"
-                    placeholder="e.g. Penicillin, Sulfa drugs (or leave blank)"
-                  />
+                  <input type="text" value={allergies} onChange={(e) => setAllergies(e.target.value)} className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-white" placeholder="e.g. Penicillin (or leave blank)" />
                 </div>
               </>
             )}
 
-            <div>
-              <label className="block text-slate-400 uppercase font-bold mb-1">
-                Account Email
-              </label>
-              <div className="relative">
-                <Mail className="w-4 h-4 text-slate-500 absolute left-3 top-3" />
-                <input
-                  type="email"
-                  required
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white outline-none focus:border-cyan-500 font-mono"
-                  placeholder="Enter your registered email"
-                />
-              </div>
-            </div>
+            {mode !== 'verify-2fa' && (
+              <>
+                <div>
+                  <label className="block text-slate-400 uppercase font-bold mb-1">
+                    Real Email ID (No Fake or Duplicate IDs) *
+                  </label>
+                  <div className="flex gap-2">
+                    <div className="relative flex-1">
+                      <Mail className="w-4 h-4 text-slate-500 absolute left-3 top-3" />
+                      <input
+                        type="email"
+                        required
+                        value={email}
+                        onChange={(e) => {
+                          setEmail(e.target.value);
+                          setOtpSent(false);
+                        }}
+                        className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white outline-none focus:border-cyan-500 font-mono"
+                        placeholder="yourname@gmail.com"
+                      />
+                    </div>
+                    {(mode === 'register' || mode === 'setup-admin') && (
+                      <button
+                        type="button"
+                        onClick={handleRequestRegistrationOtp}
+                        disabled={sendingOtp}
+                        className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl font-bold flex items-center gap-1 shrink-0 disabled:opacity-50"
+                      >
+                        <Send className="w-3.5 h-3.5" />
+                        <span>{sendingOtp ? 'Sending...' : otpSent ? 'Resend OTP' : 'Send OTP'}</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
 
-            <div>
-              <label className="block text-slate-400 uppercase font-bold mb-1">
-                Password
-              </label>
-              <div className="relative">
-                <Lock className="w-4 h-4 text-slate-500 absolute left-3 top-3" />
-                <input
-                  type={showPassword ? 'text' : 'password'}
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="w-full pl-9 pr-10 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white outline-none focus:border-cyan-500 font-mono"
-                  placeholder="Enter password"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3 top-2.5 text-slate-400 hover:text-white"
-                >
-                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
-              </div>
-            </div>
+                {(mode === 'register' || mode === 'setup-admin') && (
+                  <div>
+                    <label className="block text-slate-400 uppercase font-bold mb-1">
+                      Email Verification OTP (6 Digits) *
+                    </label>
+                    <div className="relative">
+                      <KeyRound className="w-4 h-4 text-cyan-400 absolute left-3 top-3" />
+                      <input
+                        type="text"
+                        required
+                        maxLength={6}
+                        pattern="\d{6}"
+                        value={otpCode}
+                        onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, ''))}
+                        className="w-full pl-9 pr-3 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white font-mono tracking-[0.3em] outline-none focus:border-cyan-500"
+                        placeholder="Enter 6-digit code from email"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-slate-400 uppercase font-bold mb-1">
+                    Password (Min 8 Characters) *
+                  </label>
+                  <div className="relative">
+                    <Lock className="w-4 h-4 text-slate-500 absolute left-3 top-3" />
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      required
+                      minLength={8}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      className="w-full pl-9 pr-10 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white outline-none focus:border-cyan-500 font-mono"
+                      placeholder="Enter strong password"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="absolute right-3 top-2.5 text-slate-400 hover:text-white"
+                    >
+                      {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
 
             <button
               type="submit"
@@ -348,50 +452,86 @@ export const UniversalLoginPage: React.FC = () => {
             >
               <span>
                 {loading
-                  ? 'Connecting to Hospital Database...'
+                  ? 'Verifying Security Credentials...'
+                  : mode === 'verify-2fa'
+                  ? 'Verify 2FA Code & Enter Portal'
                   : mode === 'register'
-                  ? 'Create Real Patient Account'
-                  : `Sign In as ${role.toUpperCase()}`}
+                  ? 'Verify Email & Create Patient Account'
+                  : mode === 'setup-admin'
+                  ? 'Verify Email & Register Hospital Admin'
+                  : 'Continue to 2-Step Verification'}
               </span>
               <ArrowRight className="w-4 h-4" />
             </button>
           </form>
 
-          {role === 'patient' && (
+          {mode === 'verify-2fa' && (
+            <div className="pt-2 border-t border-slate-800/80 text-center text-xs">
+              <button
+                type="button"
+                onClick={() => { setMode('login'); setOtpCode(''); setError(null); setSuccessMsg(null); }}
+                className="text-slate-400 hover:text-white font-bold"
+              >
+                ← Back to Password Entry
+              </button>
+            </div>
+          )}
+
+          {role === 'patient' && mode !== 'verify-2fa' && (
             <div className="pt-3 border-t border-slate-800/80 text-center text-xs">
               {mode === 'login' ? (
                 <button
                   type="button"
-                  onClick={() => { setMode('register'); setError(null); setSuccessMsg(null); }}
+                  onClick={() => { setMode('register'); setOtpCode(''); setOtpSent(false); setError(null); setSuccessMsg(null); }}
                   className="text-cyan-400 hover:text-cyan-300 font-bold inline-flex items-center gap-1.5"
                 >
                   <UserPlus className="w-3.5 h-3.5" />
-                  <span>New Patient? Create Real Account</span>
+                  <span>New Patient? Register with Real Email OTP</span>
                 </button>
               ) : (
                 <button
                   type="button"
-                  onClick={() => { setMode('login'); setError(null); }}
+                  onClick={() => { setMode('login'); setOtpCode(''); setError(null); }}
                   className="text-slate-400 hover:text-white font-bold"
                 >
-                  Already have an account? Back to Sign In
+                  Already registered? Back to Sign In
                 </button>
               )}
             </div>
           )}
 
-          {role !== 'patient' && (
+          {role === 'admin' && !hasAdmin && mode !== 'verify-2fa' && (
+            <div className="pt-3 border-t border-slate-800/80 text-center text-xs">
+              {mode === 'login' ? (
+                <button
+                  type="button"
+                  onClick={() => { setMode('setup-admin'); setOtpCode(''); setOtpSent(false); setError(null); }}
+                  className="text-purple-400 hover:text-purple-300 font-bold"
+                >
+                  First-Time Setup: Register Primary Hospital Admin
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => { setMode('login'); setOtpCode(''); setError(null); }}
+                  className="text-slate-400 hover:text-white font-bold"
+                >
+                  Back to Admin Sign In
+                </button>
+              )}
+            </div>
+          )}
+
+          {role === 'doctor' && mode !== 'verify-2fa' && (
             <div className="pt-2 border-t border-slate-800/80 text-center text-[11px] text-slate-500">
-              {role === 'doctor'
-                ? 'Doctor credentials are issued by the Hospital System Admin.'
-                : 'Sign in with your Hospital Administrator account.'}
+              Doctor accounts are created by the Hospital Admin and protected by 2-Step Email OTP.
             </div>
           )}
         </div>
 
         <div className="mt-5 flex items-center justify-center space-x-2 text-[11px] text-slate-500">
           <ShieldCheck className="w-4 h-4 text-emerald-400" />
-          <span>End-to-End MySQL Role-Based Access Control Active</span>
+          <span>DNS MX Email Validation + Mandatory 2FA OTP Active</span>
         </div>
       </div>
     </div>

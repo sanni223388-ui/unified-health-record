@@ -1,9 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const dns = require('dns').promises;
+const crypto = require('crypto');
 const dotenv = require('dotenv');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 const pool = require('./config/db');
 
 dotenv.config();
@@ -16,16 +19,75 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+// --- REAL EMAIL VALIDATION & SMTP TRANSPORTER ---
+const BLOCKED_DOMAINS = new Set([
+  'example.com', 'example.org', 'example.net', 'test.com', 'fake.com',
+  'mailinator.com', 'tempmail.com', '10minutemail.com', 'guerrillamail.com',
+  'yopmail.com', 'trashmail.com', 'sharklasers.com', 'dispostable.com',
+  'uhrhospital.in'
+]);
+
+async function isRealDeliverableEmail(rawEmail) {
+  const email = (rawEmail || '').trim().toLowerCase();
+  const basicRegex = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/;
+  if (!basicRegex.test(email)) {
+    return { valid: false, reason: 'Invalid email format. Enter a real email address.' };
+  }
+  const domain = email.split('@')[1];
+  if (BLOCKED_DOMAINS.has(domain)) {
+    return { valid: false, reason: `Disposable or demo domain "@${domain}" is blocked. Use a real personal or hospital email.` };
+  }
+  try {
+    const mxRecords = await dns.resolveMx(domain);
+    if (!mxRecords || mxRecords.length === 0) {
+      return { valid: false, reason: `Email domain "@${domain}" has no active mail servers.` };
+    }
+    return { valid: true, email };
+  } catch {
+    return { valid: false, reason: `Email domain "@${domain}" does not exist or cannot receive emails.` };
+  }
+}
+
+const mailTransporter = process.env.SMTP_USER && process.env.SMTP_PASS
+  ? nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+      }
+    })
+  : null;
+
+async function sendSecurityOtpEmail(toEmail, otpCode, purposeLabel) {
+  if (!mailTransporter) {
+    throw new Error('Email OTP service is not configured on server (set SMTP_USER and SMTP_PASS in Render Environment).');
+  }
+  await mailTransporter.sendMail({
+    from: `"Unified Health Security" <${process.env.SMTP_USER}>`,
+    to: toEmail,
+    subject: `${otpCode} is your Unified Health ${purposeLabel} Verification Code`,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px;">
+        <h2 style="color: #0d9488; margin-top: 0;">Unified Health Record • 2-Step Verification</h2>
+        <p style="color: #334155; font-size: 14px;">Use the 6-digit security code below to complete your <strong>${purposeLabel}</strong>:</p>
+        <div style="background: #f1f5f9; padding: 16px; text-align: center; border-radius: 8px; font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #0f172a;">
+          ${otpCode}
+        </div>
+        <p style="color: #64748b; font-size: 12px; margin-top: 16px;">This code expires in 10 minutes. If you did not request this, someone may have entered your password—do not share this code.</p>
+      </div>
+    `
+  });
+}
+
 const verifyToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ message: 'Unauthorized: Missing authentication token.' });
   }
-  const token = authHeader.split(' ')[1];
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    req.user = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
     next();
-  } catch (err) {
+  } catch {
     return res.status(403).json({ message: 'Forbidden: Expired or invalid token.' });
   }
 };
@@ -48,52 +110,127 @@ const logAudit = async (userId, action, entity, recordId) => {
   }
 };
 
-// --- HEALTH CHECK ---
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', service: 'Unified Health Record Production API' });
+// --- HEALTH & SYSTEM STATUS ---
+app.get('/api/health', async (req, res) => {
+  try {
+    const [[{ adminCount }]] = await pool.query('SELECT COUNT(*) AS adminCount FROM users WHERE role = ?', ['admin']);
+    res.json({ status: 'ok', hasAdmin: adminCount > 0, email2faConfigured: Boolean(mailTransporter) });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
 });
 
-// --- AUTHENTICATION & REAL REGISTRATION ---
+// --- STEP 1 OF REGISTRATION: SEND EMAIL VERIFICATION OTP ---
+app.post('/api/auth/request-register-otp', async (req, res) => {
+  const { email } = req.body;
+  const check = await isRealDeliverableEmail(email);
+  if (!check.valid) return res.status(400).json({ message: check.reason });
+
+  try {
+    const [existing] = await pool.execute('SELECT id FROM users WHERE email = ?', [check.email]);
+    if (existing.length > 0) {
+      return res.status(409).json({ message: 'This email ID is already registered. Duplicate accounts are not allowed.' });
+    }
+
+    const otp = crypto.randomInt(100000, 999999).toString();
+    const otpHash = await bcrypt.hash(otp, 10);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    await pool.execute('DELETE FROM email_otps WHERE email = ? AND purpose = ?', [check.email, 'register']);
+    await pool.execute(
+      'INSERT INTO email_otps (email, otp_hash, purpose, expires_at) VALUES (?, ?, ?, ?)',
+      [check.email, otpHash, 'register', expiresAt]
+    );
+
+    await sendSecurityOtpEmail(check.email, otp, 'Account Registration');
+    res.json({ message: `6-digit verification code sent to ${check.email}. Check your inbox.` });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// --- STEP 2 OF REGISTRATION: VERIFY OTP & CREATE REAL PATIENT (OR FIRST ADMIN) ---
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, fullName, dob, gender, bloodGroup, phone, address, allergies } = req.body;
-  if (!email || !password || !fullName) {
-    return res.status(400).json({ message: 'Full name, email, and password are required.' });
+  const { email, password, otp, accountType, fullName, dob, gender, bloodGroup, phone, address, allergies } = req.body;
+  const check = await isRealDeliverableEmail(email);
+  if (!check.valid) return res.status(400).json({ message: check.reason });
+  if (!password || password.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters long.' });
+  }
+  if (!otp || otp.trim().length !== 6) {
+    return res.status(400).json({ message: 'Enter the 6-digit verification code sent to your email.' });
   }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const [existing] = await conn.execute('SELECT id FROM users WHERE email = ?', [email.trim().toLowerCase()]);
+
+    const [existing] = await conn.execute('SELECT id FROM users WHERE email = ?', [check.email]);
     if (existing.length > 0) {
       await conn.rollback();
-      return res.status(409).json({ message: 'An account with this email already exists.' });
+      return res.status(409).json({ message: 'This email ID is already registered.' });
+    }
+
+    const [otpRows] = await conn.execute(
+      'SELECT * FROM email_otps WHERE email = ? AND purpose = ? AND expires_at > NOW() ORDER BY id DESC LIMIT 1',
+      [check.email, 'register']
+    );
+    if (otpRows.length === 0) {
+      await conn.rollback();
+      return res.status(400).json({ message: 'Verification code expired or not requested. Request a new code.' });
+    }
+
+    const otpValid = await bcrypt.compare(otp.trim(), otpRows[0].otp_hash);
+    if (!otpValid) {
+      await conn.rollback();
+      return res.status(401).json({ message: 'Invalid 6-digit verification code.' });
+    }
+
+    let roleToCreate = 'patient';
+    if (accountType === 'admin') {
+      const [[{ adminCount }]] = await conn.execute('SELECT COUNT(*) AS adminCount FROM users WHERE role = ?', ['admin']);
+      if (adminCount > 0) {
+        await conn.rollback();
+        return res.status(403).json({ message: 'Hospital Admin already exists. Additional admins cannot self-register.' });
+      }
+      roleToCreate = 'admin';
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
     const [userRes] = await conn.execute(
-      'INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'patient')',
-      [email.trim().toLowerCase(), passwordHash]
+      'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, ?, TRUE)',
+      [check.email, passwordHash, roleToCreate]
     );
     const userId = userRes.insertId;
 
-    const [patRes] = await conn.execute(
-      `INSERT INTO patients (user_id, full_name, date_of_birth, gender, blood_group, phone, address, allergies)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        userId,
-        fullName.trim(),
-        dob || '1995-01-01',
-        (gender || 'other').toLowerCase(),
-        bloodGroup || 'O+',
-        phone || '+91 00000 00000',
-        address || 'Bengaluru, Karnataka',
-        allergies || ''
-      ]
-    );
+    if (roleToCreate === 'patient') {
+      if (!fullName || !fullName.trim()) {
+        await conn.rollback();
+        return res.status(400).json({ message: 'Patient full name is required.' });
+      }
+      await conn.execute(
+        `INSERT INTO patients (user_id, full_name, date_of_birth, gender, blood_group, phone, address, allergies)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          userId,
+          fullName.trim(),
+          dob || '1995-01-01',
+          (gender || 'other').toLowerCase(),
+          bloodGroup || 'O+',
+          phone || '',
+          address || '',
+          allergies || ''
+        ]
+      );
+    }
 
+    await conn.execute('DELETE FROM email_otps WHERE email = ? AND purpose = ?', [check.email, 'register']);
     await conn.commit();
-    await logAudit(userId, 'REGISTER_PATIENT', 'patients', patRes.insertId);
-    res.status(201).json({ message: 'Patient account created successfully. Please sign in.' });
+    await logAudit(userId, `VERIFIED_REGISTER_${roleToCreate.toUpperCase()}`, 'users', userId);
+
+    res.status(201).json({
+      message: `${roleToCreate === 'admin' ? 'Hospital Admin' : 'Patient'} account verified and created! Sign in with 2-Step Verification.`
+    });
   } catch (err) {
     await conn.rollback();
     res.status(500).json({ message: err.message });
@@ -102,24 +239,84 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
+// --- STEP 1 OF LOGIN: VERIFY PASSWORD & SEND 2FA OTP CODE ---
 app.post('/api/auth/login', async (req, res) => {
   const { email, password, expectedRole } = req.body;
-  if (!email || !password) return res.status(400).json({ message: 'Email and password required.' });
+  const cleanEmail = (email || '').trim().toLowerCase();
+  if (!cleanEmail || !password) return res.status(400).json({ message: 'Email and password are required.' });
 
   try {
-    const [users] = await pool.execute('SELECT * FROM users WHERE email = ? AND is_active = TRUE', [email.trim().toLowerCase()]);
+    const [users] = await pool.execute('SELECT * FROM users WHERE email = ? AND is_active = TRUE', [cleanEmail]);
     if (users.length === 0) return res.status(401).json({ message: 'No active account found with this email.' });
 
     const user = users[0];
     if (expectedRole && user.role !== expectedRole) {
-      return res.status(403).json({ message: `This email is registered as a ${user.role.toUpperCase()}, not ${expectedRole.toUpperCase()}.` });
+      return res.status(403).json({ message: `This email is registered as ${user.role.toUpperCase()}, not ${expectedRole.toUpperCase()}.` });
     }
 
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) return res.status(401).json({ message: 'Incorrect password.' });
 
-    let profile = { id: user.id, email: user.email, role: user.role, name: user.email };
+    const otp = crypto.randomInt(100000, 999999).toString();
+    const otpHash = await bcrypt.hash(otp, 10);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
+    await pool.execute('DELETE FROM email_otps WHERE email = ? AND purpose = ?', [cleanEmail, 'login_2fa']);
+    await pool.execute(
+      'INSERT INTO email_otps (email, otp_hash, purpose, expires_at) VALUES (?, ?, ?, ?)',
+      [cleanEmail, otpHash, 'login_2fa', expiresAt]
+    );
+
+    await sendSecurityOtpEmail(cleanEmail, otp, '2-Step Login');
+    await logAudit(user.id, 'PASSWORD_OK_2FA_SENT', 'users', user.id);
+
+    res.json({
+      requires2FA: true,
+      email: cleanEmail,
+      message: `Password verified. Enter the 6-digit 2-Step Verification code sent to ${cleanEmail}.`
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// --- STEP 2 OF LOGIN: VERIFY 2FA OTP & ISSUE JWT ---
+app.post('/api/auth/verify-2fa', async (req, res) => {
+  const { email, otp, expectedRole } = req.body;
+  const cleanEmail = (email || '').trim().toLowerCase();
+  if (!cleanEmail || !otp) return res.status(400).json({ message: 'Email and 6-digit 2FA code are required.' });
+
+  try {
+    const [otpRows] = await pool.execute(
+      'SELECT * FROM email_otps WHERE email = ? AND purpose = ? AND expires_at > NOW() ORDER BY id DESC LIMIT 1',
+      [cleanEmail, 'login_2fa']
+    );
+    if (otpRows.length === 0) {
+      return res.status(400).json({ message: '2FA code expired. Please sign in again to request a new code.' });
+    }
+
+    if (otpRows[0].attempts >= 5) {
+      await pool.execute('DELETE FROM email_otps WHERE id = ?', [otpRows[0].id]);
+      return res.status(429).json({ message: 'Too many invalid 2FA attempts. Sign in again.' });
+    }
+
+    const isValid = await bcrypt.compare(otp.trim(), otpRows[0].otp_hash);
+    if (!isValid) {
+      await pool.execute('UPDATE email_otps SET attempts = attempts + 1 WHERE id = ?', [otpRows[0].id]);
+      return res.status(401).json({ message: 'Incorrect 2-Step Verification code.' });
+    }
+
+    await pool.execute('DELETE FROM email_otps WHERE id = ?', [otpRows[0].id]);
+
+    const [users] = await pool.execute('SELECT * FROM users WHERE email = ? AND is_active = TRUE', [cleanEmail]);
+    if (users.length === 0) return res.status(401).json({ message: 'Account not found.' });
+
+    const user = users[0];
+    if (expectedRole && user.role !== expectedRole) {
+      return res.status(403).json({ message: `Role mismatch: account is ${user.role}.` });
+    }
+
+    let profile = { id: user.id, email: user.email, role: user.role, name: user.email };
     if (user.role === 'patient') {
       const [patients] = await pool.execute('SELECT * FROM patients WHERE user_id = ?', [user.id]);
       if (patients.length) {
@@ -145,17 +342,17 @@ app.post('/api/auth/login', async (req, res) => {
         email: user.email
       },
       JWT_SECRET,
-      { expiresIn: '24h' }
+      { expiresIn: '12h' }
     );
 
-    await logAudit(user.id, 'AUTHENTICATE_LOGIN', 'users', user.id);
+    await logAudit(user.id, 'LOGIN_2FA_VERIFIED', 'users', user.id);
     res.json({ token, user: profile });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// --- PATIENT ROUTES (STRICTLY ISOLATED TO LOGGED-IN PATIENT) ---
+// --- PATIENT ROUTES (STRICTLY ISOLATED) ---
 app.get('/api/patient/dashboard', verifyToken, authorize('patient'), async (req, res) => {
   const patientId = req.user.patientId;
   try {
@@ -222,8 +419,8 @@ app.post('/api/appointments', verifyToken, authorize('patient'), async (req, res
   }
   try {
     const [result] = await pool.execute(
-      'INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, reason, status) VALUES (?, ?, ?, ?, ?, 'confirmed')',
-      [req.user.patientId, numericDoctorId, appointmentDate, appointmentTime, reason || 'General Consultation']
+      'INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, reason, status) VALUES (?, ?, ?, ?, ?, ?)',
+      [req.user.patientId, numericDoctorId, appointmentDate, appointmentTime, reason || 'General Consultation', 'confirmed']
     );
     await logAudit(req.user.id, 'BOOK_APPOINTMENT', 'appointments', result.insertId);
     res.status(201).json({ message: 'Appointment booked with real doctor.', id: result.insertId });
@@ -234,7 +431,7 @@ app.post('/api/appointments', verifyToken, authorize('patient'), async (req, res
 
 app.patch('/api/appointments/:id/cancel', verifyToken, async (req, res) => {
   try {
-    await pool.execute('UPDATE appointments SET status = 'cancelled' WHERE id = ?', [req.params.id]);
+    await pool.execute('UPDATE appointments SET status = ? WHERE id = ?', ['cancelled', req.params.id]);
     await logAudit(req.user.id, 'CANCEL_APPOINTMENT', 'appointments', req.params.id);
     res.json({ message: 'Appointment cancelled.' });
   } catch (err) {
@@ -242,7 +439,7 @@ app.patch('/api/appointments/:id/cancel', verifyToken, async (req, res) => {
   }
 });
 
-// --- DOCTOR PORTAL: DASHBOARD, CREATE PATIENT, VALID EMAIL LOOKUP & CONSULTATION ---
+// --- DOCTOR PORTAL ---
 app.get('/api/doctor/dashboard', verifyToken, authorize('doctor'), async (req, res) => {
   const doctorId = req.user.doctorId;
   try {
@@ -278,26 +475,27 @@ app.get('/api/doctor/dashboard', verifyToken, authorize('doctor'), async (req, r
   }
 });
 
-// Doctor creates a real patient account in the hospital
 app.post('/api/doctor/patients', verifyToken, authorize('doctor', 'admin'), async (req, res) => {
   const { email, password, fullName, dob, gender, bloodGroup, phone, address, allergies } = req.body;
-  if (!email || !password || !fullName) {
-    return res.status(400).json({ message: 'Patient full name, email, and temporary password are required.' });
+  const check = await isRealDeliverableEmail(email);
+  if (!check.valid) return res.status(400).json({ message: check.reason });
+  if (!password || !fullName) {
+    return res.status(400).json({ message: 'Patient full name, real email, and initial password are required.' });
   }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const [existing] = await conn.execute('SELECT id FROM users WHERE email = ?', [email.trim().toLowerCase()]);
+    const [existing] = await conn.execute('SELECT id FROM users WHERE email = ?', [check.email]);
     if (existing.length > 0) {
       await conn.rollback();
-      return res.status(409).json({ message: 'A patient account with this email already exists.' });
+      return res.status(409).json({ message: 'This patient email ID already exists.' });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
     const [userRes] = await conn.execute(
-      'INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'patient')',
-      [email.trim().toLowerCase(), passwordHash]
+      'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, ?, TRUE)',
+      [check.email, passwordHash, 'patient']
     );
 
     const [patRes] = await conn.execute(
@@ -309,8 +507,8 @@ app.post('/api/doctor/patients', verifyToken, authorize('doctor', 'admin'), asyn
         dob || '1995-01-01',
         (gender || 'other').toLowerCase(),
         bloodGroup || 'O+',
-        phone || '+91 00000 00000',
-        address || 'Bengaluru, Karnataka',
+        phone || '',
+        address || '',
         allergies || ''
       ]
     );
@@ -318,8 +516,8 @@ app.post('/api/doctor/patients', verifyToken, authorize('doctor', 'admin'), asyn
     await conn.commit();
     await logAudit(req.user.id, 'DOCTOR_CREATED_PATIENT', 'patients', patRes.insertId);
     res.status(201).json({
-      message: `Patient ${fullName} registered (${email.trim().toLowerCase()}).`,
-      patient: { id: patRes.insertId, fullName, email: email.trim().toLowerCase() }
+      message: `Patient ${fullName} registered (${check.email}). They will use 2-Step Email OTP on login.`,
+      patient: { id: patRes.insertId, fullName, email: check.email }
     });
   } catch (err) {
     await conn.rollback();
@@ -329,7 +527,6 @@ app.post('/api/doctor/patients', verifyToken, authorize('doctor', 'admin'), asyn
   }
 });
 
-// Verify patient email exists before adding medical record
 app.get('/api/doctor/patient-lookup', verifyToken, authorize('doctor', 'admin'), async (req, res) => {
   const email = (req.query.email || '').toString().trim().toLowerCase();
   if (!email) return res.status(400).json({ message: 'Please enter a patient email ID.' });
@@ -338,11 +535,11 @@ app.get('/api/doctor/patient-lookup', verifyToken, authorize('doctor', 'admin'),
     const [rows] = await pool.execute(
       `SELECT p.id, p.full_name, p.blood_group, p.gender, p.allergies, u.email
        FROM patients p JOIN users u ON p.user_id = u.id
-       WHERE u.email = ? AND u.role = 'patient'`,
-      [email]
+       WHERE u.email = ? AND u.role = ?`,
+      [email, 'patient']
     );
     if (rows.length === 0) {
-      return res.status(404).json({ message: `No registered patient found with email "${email}". Please register the patient first.` });
+      return res.status(404).json({ message: `No registered patient found with email "${email}".` });
     }
     res.json({ patient: rows[0] });
   } catch (err) {
@@ -350,7 +547,6 @@ app.get('/api/doctor/patient-lookup', verifyToken, authorize('doctor', 'admin'),
   }
 });
 
-// Doctor saves consultation strictly against an existing patient email
 app.post('/api/doctor/consultation', verifyToken, authorize('doctor'), async (req, res) => {
   const doctorId = req.user.doctorId;
   const {
@@ -376,14 +572,14 @@ app.post('/api/doctor/consultation', verifyToken, authorize('doctor'), async (re
 
     const [patRows] = await conn.execute(
       `SELECT p.id, p.full_name FROM patients p JOIN users u ON p.user_id = u.id
-       WHERE u.email = ? AND u.role = 'patient'`,
-      [patientEmail.trim().toLowerCase()]
+       WHERE u.email = ? AND u.role = ?`,
+      [patientEmail.trim().toLowerCase(), 'patient']
     );
 
     if (patRows.length === 0) {
       await conn.rollback();
       return res.status(404).json({
-        message: `Invalid Patient Email: No patient account exists for "${patientEmail}". Create the patient account first.`
+        message: `Invalid Patient Email: No patient account exists for "${patientEmail}".`
       });
     }
 
@@ -399,8 +595,8 @@ app.post('/api/doctor/consultation', verifyToken, authorize('doctor'), async (re
     if (prescriptionItems && prescriptionItems.length > 0) {
       const [presc] = await conn.execute(
         `INSERT INTO prescriptions (medical_record_id, patient_id, doctor_id, prescribed_date, status, instructions)
-         VALUES (?, ?, ?, CURDATE(), 'active', ?)`,
-        [recordId, targetPatientId, doctorId, prescriptionInstructions || '']
+         VALUES (?, ?, ?, CURDATE(), ?, ?)`,
+        [recordId, targetPatientId, doctorId, 'active', prescriptionInstructions || '']
       );
       for (const item of prescriptionItems) {
         if (item.medicine && item.medicine.trim()) {
@@ -416,8 +612,8 @@ app.post('/api/doctor/consultation', verifyToken, authorize('doctor'), async (re
     if (labTestName && labTestName.trim()) {
       await conn.execute(
         `INSERT INTO lab_reports (patient_id, doctor_id, test_name, test_type, test_date, laboratory_name, result_summary, document_url)
-         VALUES (?, ?, ?, 'Clinical Lab', CURDATE(), 'Hospital Central Diagnostics', ?, 'verified-ledger')`,
-        [targetPatientId, doctorId, labTestName.trim(), labResultSummary || 'Normal']
+         VALUES (?, ?, ?, ?, CURDATE(), ?, ?, ?)`,
+        [targetPatientId, doctorId, labTestName.trim(), 'Clinical Lab', 'Hospital Central Diagnostics', labResultSummary || 'Normal', 'verified-ledger']
       );
     }
 
@@ -436,7 +632,7 @@ app.post('/api/doctor/consultation', verifyToken, authorize('doctor'), async (re
   }
 });
 
-// --- REAL DOCTORS DIRECTORY (WITH LOCATION & RADIUS) ---
+// --- REAL DOCTORS DIRECTORY ---
 app.get('/api/doctors', async (req, res) => {
   try {
     const [docs] = await pool.execute(
@@ -471,23 +667,26 @@ app.post('/api/admin/doctors', verifyToken, authorize('admin'), async (req, res)
     consultationFee
   } = req.body;
 
-  if (!fullName || !email || !password || !specialization || !licenseNumber) {
-    return res.status(400).json({ message: 'Name, email, password, specialization, and license number are required.' });
+  const check = await isRealDeliverableEmail(email);
+  if (!check.valid) return res.status(400).json({ message: check.reason });
+
+  if (!fullName || !password || !specialization || !licenseNumber) {
+    return res.status(400).json({ message: 'Name, real email, password, specialization, and license number are required.' });
   }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const [existing] = await conn.execute('SELECT id FROM users WHERE email = ?', [email.trim().toLowerCase()]);
+    const [existing] = await conn.execute('SELECT id FROM users WHERE email = ?', [check.email]);
     if (existing.length > 0) {
       await conn.rollback();
-      return res.status(409).json({ message: 'A user with this email already exists.' });
+      return res.status(409).json({ message: 'This email ID already exists.' });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
     const [userRes] = await conn.execute(
-      'INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'doctor')',
-      [email.trim().toLowerCase(), passwordHash]
+      'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, ?, TRUE)',
+      [check.email, passwordHash, 'doctor']
     );
 
     const [docRes] = await conn.execute(
@@ -499,8 +698,8 @@ app.post('/api/admin/doctors', verifyToken, authorize('admin'), async (req, res)
         specialization.trim(),
         licenseNumber.trim(),
         hospitalAffiliation || 'City General Hospital',
-        phone || '+91 80 4000 1000',
-        area || 'Bengaluru Central',
+        phone || '',
+        area || 'Bengaluru',
         latitude || 12.9716,
         longitude || 77.5946,
         Number(consultationRadiusKm) || 15,
@@ -510,7 +709,7 @@ app.post('/api/admin/doctors', verifyToken, authorize('admin'), async (req, res)
 
     await conn.commit();
     await logAudit(req.user.id, `ADMIN_CREATED_DOCTOR_${licenseNumber}`, 'doctors', docRes.insertId);
-    res.status(201).json({ message: `Doctor ${fullName} registered and active in directory.` });
+    res.status(201).json({ message: `Doctor ${fullName} (${check.email}) registered. They will sign in using 2-Step Email OTP.` });
   } catch (err) {
     await conn.rollback();
     res.status(500).json({ message: err.message });
@@ -542,9 +741,7 @@ app.get('/api/admin/telemetry', verifyToken, authorize('admin'), async (req, res
   }
 });
 
-app.listen(PORT, () => console.log(`Secure Healthcare Backend running at http://localhost:${PORT}`));
-
-// --- AUTO-INITIALIZE AIVEN DEFAULTDB TABLES & 1 DEMO ACCOUNT PER ROLE ---
+// --- INITIALIZE PRODUCTION TABLES (ZERO DEMO ACCOUNTS) ---
 (async () => {
   try {
     await pool.query(`
@@ -556,6 +753,18 @@ app.listen(PORT, () => console.log(`Secure Healthcare Backend running at http://
         is_active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS email_otps (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(191) NOT NULL,
+        otp_hash VARCHAR(255) NOT NULL,
+        purpose VARCHAR(32) NOT NULL,
+        attempts INT DEFAULT 0,
+        expires_at DATETIME NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_otp_email (email)
       ) ENGINE=InnoDB
     `);
     await pool.query(`
@@ -707,39 +916,11 @@ app.listen(PORT, () => console.log(`Secure Healthcare Backend running at http://
       ) ENGINE=InnoDB
     `);
 
-    const [[{ cnt }]] = await pool.query('SELECT COUNT(*) AS cnt FROM users');
-    if (cnt === 0) {
-      const adminPass = await bcrypt.hash('Admin@2026', 10);
-      const doctorPass = await bcrypt.hash('Doctor@2026', 10);
-      const patientPass = await bcrypt.hash('Patient@2026', 10);
-
-      await pool.execute(
-        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, 'admin', TRUE)',
-        ['admin@uhrhospital.in', adminPass]
-      );
-
-      const [docUser] = await pool.execute(
-        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, 'doctor', TRUE)',
-        ['doctor@uhrhospital.in', doctorPass]
-      );
-      await pool.execute(
-        `INSERT INTO doctors (user_id, full_name, specialization, license_number, hospital_affiliation, phone, area, latitude, longitude, consultation_radius_km, consultation_fee)
-         VALUES (?, 'Dr. Ananya Rao', 'General Physician & Cardiologist', 'KMC-2026-412', 'UHR Multispeciality Hospital', '+91 80 4123 4567', 'Hebbal, Bengaluru', 13.0358, 77.5970, 20, '₹700')`,
-        [docUser.insertId]
-      );
-
-      const [patUser] = await pool.execute(
-        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, 'patient', TRUE)',
-        ['patient@uhrhospital.in', patientPass]
-      );
-      await pool.execute(
-        `INSERT INTO patients (user_id, full_name, date_of_birth, gender, blood_group, phone, address, allergies)
-         VALUES (?, 'Rahul Verma', '1999-04-18', 'male', 'O+', '+91 98765 43210', 'Hebbal, Bengaluru, Karnataka', 'Penicillin')`,
-        [patUser.insertId]
-      );
-      console.log('Initialized defaultdb with 1 Admin, 1 Doctor, and 1 Patient.');
-    }
+    await pool.execute('DELETE FROM users WHERE email LIKE ? OR email LIKE ?', ['%@example.com', '%@uhrhospital.in']);
+    console.log('✅ Production schema ready (zero demo accounts, 2FA + DNS MX email validation active).');
   } catch (err) {
-    console.error('Auto-init DB error:', err.message);
+    console.error('DB init error:', err.message);
   }
 })();
+
+app.listen(PORT, () => console.log(`Secure Healthcare Backend running at http://localhost:${PORT}`));
