@@ -61,7 +61,7 @@ export const UniversalLoginPage: React.FC = () => {
 
     // Try backend authentication first; fall back to local demo authentication
     try {
-      const response = await fetch('http://localhost:5001/api/auth/login', {
+      const response = await fetch('https://unified-health-record.onrender.com/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password })

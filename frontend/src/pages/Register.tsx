@@ -9,7 +9,7 @@ export const Register: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
-    const res = await fetch('http://localhost:5001/api/auth/register', {
+    const res = await fetch('https://unified-health-record.onrender.com/api/auth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ role, fullName, email, password })

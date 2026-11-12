@@ -10,7 +10,7 @@ export const BookAppointment: React.FC<{ onNavigate: (page: string) => void }> =
   const [reason, setReason] = useState('');
 
   useEffect(() => {
-    fetch('http://localhost:5001/api/doctors').then(r => r.json()).then(d => {
+    fetch('https://unified-health-record.onrender.com/api/doctors').then(r => r.json()).then(d => {
       setDoctors(d);
       if (d.length) setDoctorId(d[0].id.toString());
     });
@@ -18,7 +18,7 @@ export const BookAppointment: React.FC<{ onNavigate: (page: string) => void }> =
 
   const handleBook = async (e: React.FormEvent) => {
     e.preventDefault();
-    await fetch('http://localhost:5001/api/appointments', {
+    await fetch('https://unified-health-record.onrender.com/api/appointments', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ doctorId, appointmentDate, appointmentTime, reason })

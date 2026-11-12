@@ -6,7 +6,7 @@ export const AdminDashboard: React.FC<{ onNavigate: (page: string) => void }> = 
   const [data, setData] = useState<any>(null);
 
   useEffect(() => {
-    fetch('http://localhost:5001/api/admin/stats', {
+    fetch('https://unified-health-record.onrender.com/api/admin/stats', {
       headers: { Authorization: `Bearer ${token}` }
     }).then(r => r.json()).then(setData);
   }, []);

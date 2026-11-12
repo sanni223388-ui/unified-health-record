@@ -247,7 +247,7 @@ export const HealthRecordProvider: React.FC<{ children: React.ReactNode }> = ({ 
     try {
       // 1. Fetch live Patient Dashboard if patient role
       if (activeRole === 'patient') {
-        const res = await fetch('http://localhost:5001/api/patient/dashboard', {
+        const res = await fetch('https://unified-health-record.onrender.com/api/patient/dashboard', {
           headers: { Authorization: `Bearer ${token}` }
         });
         if (res.ok) {
@@ -327,7 +327,7 @@ export const HealthRecordProvider: React.FC<{ children: React.ReactNode }> = ({ 
       }
 
       // 2. Fetch Doctors Directory
-      const docsRes = await fetch('http://localhost:5001/api/doctors');
+      const docsRes = await fetch('https://unified-health-record.onrender.com/api/doctors');
       if (docsRes.ok) {
         const docList = await docsRes.json();
         if (docList.length > 0) {
@@ -355,7 +355,7 @@ export const HealthRecordProvider: React.FC<{ children: React.ReactNode }> = ({ 
     const token = localStorage.getItem('uhr_jwt_token');
     if (token) {
       try {
-        await fetch('http://localhost:5001/api/patient/profile', {
+        await fetch('https://unified-health-record.onrender.com/api/patient/profile', {
           method: 'PUT',
           headers: {
             'Content-Type': 'application/json',
@@ -398,7 +398,7 @@ export const HealthRecordProvider: React.FC<{ children: React.ReactNode }> = ({ 
     const token = localStorage.getItem('uhr_jwt_token');
     if (token) {
       try {
-        await fetch('http://localhost:5001/api/appointments', {
+        await fetch('https://unified-health-record.onrender.com/api/appointments', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -423,7 +423,7 @@ export const HealthRecordProvider: React.FC<{ children: React.ReactNode }> = ({ 
     const numericId = id.replace('APT-', '');
     if (token) {
       try {
-        await fetch(`http://localhost:5001/api/appointments/${numericId}/cancel`, {
+        await fetch(`https://unified-health-record.onrender.com/api/appointments/${numericId}/cancel`, {
           method: 'PATCH',
           headers: { Authorization: `Bearer ${token}` }
         });

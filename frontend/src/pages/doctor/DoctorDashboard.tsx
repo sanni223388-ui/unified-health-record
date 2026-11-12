@@ -6,7 +6,7 @@ export const DoctorDashboard: React.FC<{ onNavigate: (page: string) => void }> =
   const [appts, setAppts] = useState<any[]>([]);
 
   useEffect(() => {
-    fetch('http://localhost:5001/api/appointments', {
+    fetch('https://unified-health-record.onrender.com/api/appointments', {
       headers: { Authorization: `Bearer ${token}` }
     }).then(r => r.json()).then(setAppts);
   }, []);

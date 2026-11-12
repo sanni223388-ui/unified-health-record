@@ -7,7 +7,7 @@ export const PatientDashboard: React.FC<{ onNavigate: (page: string) => void }> 
   const [data, setData] = useState<any>(null);
 
   useEffect(() => {
-    fetch('http://localhost:5001/api/patient/dashboard', {
+    fetch('https://unified-health-record.onrender.com/api/patient/dashboard', {
       headers: { Authorization: `Bearer ${token}` }
     }).then(res => res.json()).then(setData);
   }, []);
