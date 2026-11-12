@@ -1,5 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 
+const API_BASE = 'https://unified-health-record.onrender.com';
+
 export interface Vitals {
   bloodPressure: string;
   heartRate: string;
@@ -20,6 +22,7 @@ export interface ConsultationRecord {
   id: string;
   patientId: string;
   patientName: string;
+  patientEmail?: string;
   doctorId: string;
   doctorName: string;
   date: string;
@@ -37,6 +40,7 @@ export interface Appointment {
   id: string;
   patientId: string;
   patientName: string;
+  patientEmail?: string;
   doctorId: string;
   doctorName: string;
   doctorSpecialty: string;
@@ -94,10 +98,18 @@ export interface PatientProfile {
 
 export interface DoctorUser {
   id: string;
+  numericId: number;
   name: string;
+  email?: string;
   specialty: string;
   hospital: string;
+  area: string;
+  phone: string;
   licenseNumber: string;
+  lat: number;
+  lng: number;
+  radiusKm: number;
+  fee: string;
   status: 'Verified' | 'Pending Verification' | 'Suspended';
 }
 
@@ -115,7 +127,7 @@ interface HealthRecordContextType {
   setActiveRole: (role: 'patient' | 'doctor' | 'admin') => void;
   isAuthenticated: boolean;
   setIsAuthenticated: (val: boolean) => void;
-  currentUser: { email: string; name: string; role: 'patient' | 'doctor' | 'admin' } | null;
+  currentUser: any;
   setCurrentUser: (usr: any) => void;
   theme: 'light' | 'dark';
   toggleTheme: () => void;
@@ -129,43 +141,50 @@ interface HealthRecordContextType {
   addDocument: (doc: Omit<HealthDocument, 'id' | 'uploadedAt'>) => void;
   doctors: DoctorUser[];
   auditLogs: AuditLog[];
-  addConsultation: (record: Omit<ConsultationRecord, 'id' | 'date'>) => void;
-  bookAppointment: (appt: Omit<Appointment, 'id' | 'status'>) => void;
+  adminStats: { totalPatients: number; totalDoctors: number; totalRecords: number; totalAppointments: number };
+  doctorStats: { totalPatients: number };
+  addConsultation: (record: any) => Promise<{ ok: boolean; message: string }>;
+  bookAppointment: (appt: Omit<Appointment, 'id' | 'status'>) => Promise<{ ok: boolean; message: string }>;
   cancelAppointment: (id: string) => void;
   updateAppointmentStatus: (id: string, status: Appointment['status']) => void;
   verifyDoctor: (id: string, status: DoctorUser['status']) => void;
-  refreshData: () => void;
+  refreshData: () => Promise<void>;
   logout: () => void;
 }
 
-const defaultProfile: PatientProfile = {
-  fullName: 'John Doe',
-  dob: '1992-05-14',
-  gender: 'Male',
+const emptyProfile: PatientProfile = {
+  fullName: 'Patient',
+  dob: '',
+  gender: '',
   bloodGroup: 'O+',
-  phone: '+91 98765 43210',
-  email: 'patient@example.com',
-  address: '742 Evergreen Terrace, Bengaluru, Karnataka, India',
-  allergies: ['Penicillin (Severe Anaphylaxis)', 'Shellfish / Crustaceans', 'Dust Mites'],
-  chronicConditions: ['Stage 1 Essential Hypertension', 'Mild Intermittent Asthma'],
+  phone: '',
+  email: '',
+  address: '',
+  allergies: [],
+  chronicConditions: [],
   emergencyContact: {
-    name: 'Mary Doe',
-    relationship: 'Spouse',
-    phone: '+91 98765 43211',
-    alternatePhone: '+91 80 2345 6789'
+    name: 'Not Configured',
+    relationship: 'Emergency Contact',
+    phone: '',
+    alternatePhone: ''
   }
 };
 
 const HealthRecordContext = createContext<HealthRecordContextType | undefined>(undefined);
 
 export const HealthRecordProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [activeRole, setActiveRole] = useState<'patient' | 'doctor' | 'admin'>('patient');
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    return Boolean(localStorage.getItem('uhr_jwt_token'));
-  });
   const [currentUser, setCurrentUser] = useState<any>(() => {
     const saved = localStorage.getItem('uhr_user');
-    return saved ? JSON.parse(saved) : { email: 'patient@example.com', name: 'John Doe', role: 'patient' };
+    return saved ? JSON.parse(saved) : null;
+  });
+
+  const [activeRole, setActiveRole] = useState<'patient' | 'doctor' | 'admin'>(() => {
+    const saved = localStorage.getItem('uhr_user');
+    return saved ? JSON.parse(saved).role : 'patient';
+  });
+
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
+    return Boolean(localStorage.getItem('uhr_jwt_token'));
   });
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -181,168 +200,200 @@ export const HealthRecordProvider: React.FC<{ children: React.ReactNode }> = ({ 
     }
   }, [theme]);
 
-  const toggleTheme = () => {
-    setTheme(prev => (prev === 'light' ? 'dark' : 'light'));
-  };
+  const toggleTheme = () => setTheme(prev => (prev === 'light' ? 'dark' : 'light'));
 
-  const [profile, setProfile] = useState<PatientProfile>(defaultProfile);
-  const [doctors, setDoctors] = useState<DoctorUser[]>([
-    { id: 'DOC-1', name: 'Dr. Ananya Sharma', specialty: 'Cardiologist', hospital: 'Apollo Heart Center', licenseNumber: 'MCI-78192', status: 'Verified' },
-    { id: 'DOC-2', name: 'Dr. Rajesh Patel', specialty: 'Endocrinologist', hospital: 'Apex Health Institute', licenseNumber: 'MCI-55219', status: 'Verified' },
-    { id: 'DOC-3', name: 'Dr. Vikram Malhotra', specialty: 'Pulmonologist', hospital: 'Metro Clinic', licenseNumber: 'MCI-99014', status: 'Verified' },
-  ]);
+  const [profile, setProfile] = useState<PatientProfile>(emptyProfile);
+  const [doctors, setDoctors] = useState<DoctorUser[]>([]);
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
+  const [consultations, setConsultations] = useState<ConsultationRecord[]>([]);
+  const [labReports, setLabReports] = useState<LabReport[]>([]);
+  const [vaccinations] = useState<Vaccination[]>([]);
+  const [documents, setDocuments] = useState<HealthDocument[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [adminStats, setAdminStats] = useState({ totalPatients: 0, totalDoctors: 0, totalRecords: 0, totalAppointments: 0 });
+  const [doctorStats, setDoctorStats] = useState({ totalPatients: 0 });
 
-  const [appointments, setAppointments] = useState<Appointment[]>([
-    { id: 'APT-101', patientId: 'PAT-1', patientName: 'John Doe', doctorId: 'DOC-1', doctorName: 'Dr. Ananya Sharma', doctorSpecialty: 'Cardiologist', time: '09:00 AM', date: '2026-10-15', type: 'Cardiology Review', status: 'Confirmed' },
-    { id: 'APT-102', patientId: 'PAT-1', patientName: 'John Doe', doctorId: 'DOC-2', doctorName: 'Dr. Rajesh Patel', doctorSpecialty: 'Endocrinologist', time: '02:30 PM', date: '2026-11-05', type: 'HbA1c Follow-up', status: 'Pending' },
-  ]);
-
-  const [consultations, setConsultations] = useState<ConsultationRecord[]>([
-    {
-      id: 'ENC-9001',
-      patientId: 'PAT-1',
-      patientName: 'John Doe',
-      doctorId: 'DOC-1',
-      doctorName: 'Dr. Ananya Sharma',
-      date: '2026-06-12',
-      chiefComplaint: 'Morning occipital headaches and mild exertional fatigue',
-      symptoms: ['Headache', 'Dizziness', 'Palpitations'],
-      vitals: { bloodPressure: '138/88 mmHg', heartRate: '78 bpm', temperature: '98.4 °F', oxygenSaturation: '99%' },
-      clinicalFindings: 'Bilateral lung clear, S1/S2 heard, no peripheral edema.',
-      diagnosis: 'Stage 1 Essential Hypertension',
-      treatment: 'Low-sodium diet (<2g/day), aerobic exercise, initiate ACE inhibitor.',
-      prescriptions: [
-        { id: 'RX-1', medicine: 'Lisinopril', dosage: '10mg', frequency: 'Once Daily', duration: '90 Days', instructions: 'Take in morning with water' },
-        { id: 'RX-2', medicine: 'Amlodipine', dosage: '5mg', frequency: 'Once Daily', duration: '30 Days', instructions: 'Take at bedtime' }
-      ],
-      followUpDate: '2026-10-15'
-    }
-  ]);
-
-  const [labReports, setLabReports] = useState<LabReport[]>([
-    { id: 'LAB-501', testName: 'Comprehensive Metabolic Panel (CMP)', category: 'Biochemistry', date: '2026-06-10', laboratory: 'Apex Diagnostics Lab', result: 'Glucose: 94 mg/dL, BUN: 14 mg/dL, Creatinine: 0.9 mg/dL.', status: 'Normal', fileSize: '1.4 MB' },
-    { id: 'LAB-502', testName: 'Lipid Profile (Full Serum)', category: 'Biochemistry', date: '2026-06-10', laboratory: 'Apex Diagnostics Lab', result: 'Total Cholesterol: 195 mg/dL, LDL: 118 mg/dL, HDL: 52 mg/dL.', status: 'Borderline', fileSize: '850 KB' }
-  ]);
-
-  const [vaccinations, setVaccinations] = useState<Vaccination[]>([
-    { id: 'VAC-01', vaccineName: 'COVID-19 Bivalent mRNA Booster', batchNumber: 'MD-88190-X', dateAdministered: '2025-09-14', clinic: 'Apollo Health Immunization Center' },
-    { id: 'VAC-02', vaccineName: 'Influenza Quadrivalent Vaccine (2025-2026)', batchNumber: 'FL-44021-Q', dateAdministered: '2025-10-02', clinic: 'Metro Community Clinic', nextDose: 'October 2026' }
-  ]);
-
-  const [documents, setDocuments] = useState<HealthDocument[]>([
-    { id: 'DOC-01', title: 'Cardiology 12-Lead ECG Tracing Report.pdf', type: 'ECG / Cardiology', uploadedAt: '2026-06-12', size: '2.4 MB' },
-    { id: 'DOC-02', title: 'Medical Health Insurance Policy Schedule.pdf', type: 'Insurance', uploadedAt: '2026-01-05', size: '4.2 MB' }
-  ]);
-
-  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([
-    { id: 'LOG-1', timestamp: '14:22:10', actor: 'Dr. Ananya Sharma', role: 'Doctor', action: 'Accessed Patient Record #PAT-1', severity: 'INFO' },
-    { id: 'LOG-2', timestamp: '14:25:30', actor: 'Dr. Ananya Sharma', role: 'Doctor', action: 'Issued e-Prescription (Lisinopril 10mg)', severity: 'INFO' }
-  ]);
-
-  // LIVE API SYNC FUNCTION
   const refreshData = async () => {
     const token = localStorage.getItem('uhr_jwt_token');
-    if (!token) return;
 
     try {
-      // 1. Fetch live Patient Dashboard if patient role
+      // Always fetch real doctors from MySQL
+      const docsRes = await fetch(`${API_BASE}/api/doctors`);
+      if (docsRes.ok) {
+        const docList = await docsRes.json();
+        setDoctors(
+          docList.map((d: any) => ({
+            id: `DOC-${d.id}`,
+            numericId: d.id,
+            name: d.full_name,
+            email: d.email,
+            specialty: d.specialization,
+            hospital: d.hospital_affiliation || 'Hospital',
+            area: d.area || 'Bengaluru',
+            phone: d.phone || '',
+            licenseNumber: d.license_number || `MCI-${d.id}`,
+            lat: Number(d.latitude) || 12.9716,
+            lng: Number(d.longitude) || 77.5946,
+            radiusKm: Number(d.consultation_radius_km) || 15,
+            fee: d.consultation_fee || '₹700',
+            status: d.is_active ? 'Verified' : 'Suspended'
+          }))
+        );
+      }
+
+      if (!token) return;
+
       if (activeRole === 'patient') {
-        const res = await fetch('https://unified-health-record.onrender.com/api/patient/dashboard', {
+        const res = await fetch(`${API_BASE}/api/patient/dashboard`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         if (res.ok) {
           const data = await res.json();
+          const pName = data.patient?.full_name || currentUser?.name || 'Patient';
           if (data.patient) {
-            setProfile(prev => ({
-              ...prev,
-              fullName: data.patient.full_name || prev.fullName,
-              dob: data.patient.date_of_birth ? data.patient.date_of_birth.split('T')[0] : prev.dob,
-              gender: data.patient.gender || prev.gender,
-              bloodGroup: data.patient.blood_group || prev.bloodGroup,
-              phone: data.patient.phone || prev.phone,
-              address: data.patient.address || prev.address,
-              allergies: data.patient.allergies ? data.patient.allergies.split(', ') : prev.allergies
-            }));
-          }
-
-          if (data.emergencyContact) {
-            setProfile(prev => ({
-              ...prev,
+            setProfile({
+              fullName: pName,
+              dob: data.patient.date_of_birth ? data.patient.date_of_birth.split('T')[0] : '',
+              gender: data.patient.gender || '',
+              bloodGroup: data.patient.blood_group || 'O+',
+              phone: data.patient.phone || '',
+              email: data.email || currentUser?.email || '',
+              address: data.patient.address || '',
+              allergies: data.patient.allergies ? data.patient.allergies.split(',').map((s: string) => s.trim()).filter(Boolean) : [],
+              chronicConditions: data.patient.chronic_conditions ? data.patient.chronic_conditions.split(',').map((s: string) => s.trim()).filter(Boolean) : [],
               emergencyContact: {
-                name: data.emergencyContact.contact_name || prev.emergencyContact.name,
-                relationship: data.emergencyContact.relationship || prev.emergencyContact.relationship,
-                phone: data.emergencyContact.phone || prev.emergencyContact.phone,
-                alternatePhone: prev.emergencyContact.alternatePhone
+                name: data.emergencyContact?.contact_name || 'Not Configured',
+                relationship: data.emergencyContact?.relationship || 'Emergency',
+                phone: data.emergencyContact?.phone_number || '',
+                alternatePhone: ''
               }
-            }));
+            });
           }
 
-          if (data.appointments && data.appointments.length > 0) {
-            setAppointments(data.appointments.map((a: any) => ({
+          setAppointments(
+            (data.appointments || []).map((a: any) => ({
               id: `APT-${a.id}`,
               patientId: String(a.patient_id),
-              patientName: 'John Doe',
-              doctorId: String(a.doctor_id),
-              doctorName: a.doctor_name || 'Dr. Ananya Sharma',
-              doctorSpecialty: a.specialization || 'General',
-              time: a.appointment_time || '10:00 AM',
-              date: a.appointment_date ? a.appointment_date.split('T')[0] : '2026-10-15',
-              type: a.reason || 'Checkup',
-              status: a.status || 'Confirmed'
-            })));
+              patientName: pName,
+              doctorId: `DOC-${a.doctor_id}`,
+              doctorName: a.doctor_name,
+              doctorSpecialty: a.specialization,
+              time: a.appointment_time,
+              date: a.appointment_date ? a.appointment_date.split('T')[0] : '',
+              type: a.reason,
+              status: (a.status ? a.status.charAt(0).toUpperCase() + a.status.slice(1) : 'Confirmed') as Appointment['status']
+            }))
+          );
+
+          const prescMap: Record<number, PrescriptionItem[]> = {};
+          for (const pr of data.prescriptions || []) {
+            if (pr.medical_record_id) {
+              prescMap[pr.medical_record_id] = (pr.items || []).map((it: any) => ({
+                id: `RX-${it.id}`,
+                medicine: it.medicine_name,
+                dosage: it.dosage,
+                frequency: it.frequency,
+                duration: it.duration,
+                instructions: it.special_notes || ''
+              }));
+            }
           }
 
-          if (data.records && data.records.length > 0) {
-            setConsultations(data.records.map((r: any) => ({
+          setConsultations(
+            (data.records || []).map((r: any) => ({
               id: `ENC-${r.id}`,
               patientId: String(r.patient_id),
-              patientName: 'John Doe',
-              doctorId: String(r.doctor_id),
-              doctorName: r.doctor_name || 'Dr. Ananya Sharma',
-              date: r.record_date ? r.record_date.split('T')[0] : '2026-06-12',
-              chiefComplaint: r.diagnosis || 'Clinical Encounter',
-              symptoms: r.symptoms ? r.symptoms.split(',') : ['Review'],
-              vitals: { bloodPressure: '130/84 mmHg', heartRate: '75 bpm', temperature: '98.6 °F', oxygenSaturation: '99%' },
-              clinicalFindings: r.clinical_notes || 'All vitals documented within normal limits.',
-              diagnosis: r.diagnosis || 'Unspecified Encounter',
-              treatment: r.treatment_plan || 'Continue prescribed routine.',
-              prescriptions: [],
+              patientName: pName,
+              doctorId: `DOC-${r.doctor_id}`,
+              doctorName: r.doctor_name,
+              date: r.record_date ? r.record_date.split('T')[0] : '',
+              chiefComplaint: r.diagnosis,
+              symptoms: r.symptoms ? r.symptoms.split(',').map((s: string) => s.trim()).filter(Boolean) : [],
+              vitals: { bloodPressure: 'Recorded', heartRate: 'Recorded', temperature: 'Recorded', oxygenSaturation: 'Recorded' },
+              clinicalFindings: r.clinical_notes || '',
+              diagnosis: r.diagnosis,
+              treatment: r.treatment_plan || '',
+              prescriptions: prescMap[r.id] || [],
               followUpDate: r.follow_up_date ? r.follow_up_date.split('T')[0] : 'As Advised'
-            })));
-          }
+            }))
+          );
 
-          if (data.labReports && data.labReports.length > 0) {
-            setLabReports(data.labReports.map((l: any) => ({
+          setLabReports(
+            (data.labReports || []).map((l: any) => ({
               id: `LAB-${l.id}`,
-              testName: l.test_name || 'Diagnostic Panel',
-              category: l.category || 'Biochemistry',
-              date: l.test_date ? l.test_date.split('T')[0] : '2026-06-10',
-              laboratory: 'Apex Diagnostics Lab',
-              result: l.result_summary || 'Normal physiological values.',
-              status: l.status || 'Normal',
-              fileSize: '1.2 MB'
-            })));
-          }
+              testName: l.test_name,
+              category: l.test_type || 'Clinical Lab',
+              date: l.test_date ? l.test_date.split('T')[0] : '',
+              laboratory: l.laboratory_name || 'Hospital Diagnostics',
+              result: l.result_summary,
+              status: 'Normal',
+              fileSize: 'Verified'
+            }))
+          );
         }
-      }
-
-      // 2. Fetch Doctors Directory
-      const docsRes = await fetch('https://unified-health-record.onrender.com/api/doctors');
-      if (docsRes.ok) {
-        const docList = await docsRes.json();
-        if (docList.length > 0) {
-          setDoctors(docList.map((d: any) => ({
-            id: `DOC-${d.id}`,
-            name: d.full_name,
-            specialty: d.specialization,
-            hospital: d.hospital_affiliation || 'Apollo Hospital',
-            licenseNumber: `MCI-${d.id * 1892}`,
-            status: 'Verified'
-          })));
+      } else if (activeRole === 'doctor') {
+        const res = await fetch(`${API_BASE}/api/doctor/dashboard`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setDoctorStats({ totalPatients: data.totalPatients || 0 });
+          setAppointments(
+            (data.appointments || []).map((a: any) => ({
+              id: `APT-${a.id}`,
+              patientId: String(a.patient_id),
+              patientName: a.patient_name,
+              patientEmail: a.patient_email,
+              doctorId: `DOC-${a.doctor_id}`,
+              doctorName: data.doctor?.full_name || currentUser?.name || 'Doctor',
+              doctorSpecialty: data.doctor?.specialization || 'Specialist',
+              time: a.appointment_time,
+              date: a.appointment_date ? a.appointment_date.split('T')[0] : '',
+              type: a.reason,
+              status: (a.status ? a.status.charAt(0).toUpperCase() + a.status.slice(1) : 'Confirmed') as Appointment['status']
+            }))
+          );
+          setConsultations(
+            (data.consultations || []).map((r: any) => ({
+              id: `ENC-${r.id}`,
+              patientId: String(r.patient_id),
+              patientName: r.patient_name,
+              patientEmail: r.patient_email,
+              doctorId: `DOC-${r.doctor_id}`,
+              doctorName: data.doctor?.full_name || 'Doctor',
+              date: r.record_date ? r.record_date.split('T')[0] : '',
+              chiefComplaint: r.diagnosis,
+              symptoms: r.symptoms ? r.symptoms.split(',') : [],
+              vitals: { bloodPressure: '', heartRate: '', temperature: '', oxygenSaturation: '' },
+              clinicalFindings: r.clinical_notes || '',
+              diagnosis: r.diagnosis,
+              treatment: r.treatment_plan || '',
+              prescriptions: [],
+              followUpDate: r.follow_up_date ? r.follow_up_date.split('T')[0] : ''
+            }))
+          );
+        }
+      } else if (activeRole === 'admin') {
+        const res = await fetch(`${API_BASE}/api/admin/telemetry`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.stats) setAdminStats(data.stats);
+          setAuditLogs(
+            (data.recentAudit || []).map((l: any) => ({
+              id: `LOG-${l.id}`,
+              timestamp: new Date(l.created_at).toLocaleTimeString(),
+              actor: l.email,
+              role: (l.role ? l.role.charAt(0).toUpperCase() + l.role.slice(1) : 'System') as AuditLog['role'],
+              action: l.action,
+              severity: 'INFO'
+            }))
+          );
         }
       }
     } catch (err) {
-      console.warn('Backend fetch failed, relying on context cache:', err);
+      console.error('Live sync error:', err);
     }
   };
 
@@ -354,96 +405,93 @@ export const HealthRecordProvider: React.FC<{ children: React.ReactNode }> = ({ 
     setProfile(prev => ({ ...prev, ...updated }));
     const token = localStorage.getItem('uhr_jwt_token');
     if (token) {
-      try {
-        await fetch('https://unified-health-record.onrender.com/api/patient/profile', {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`
-          },
-          body: JSON.stringify({ phone: updated.phone, address: updated.address })
-        });
-      } catch (err) {
-        console.error('Profile update failed:', err);
-      }
+      await fetch(`${API_BASE}/api/patient/profile`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ phone: updated.phone ?? profile.phone, address: updated.address ?? profile.address })
+      });
     }
   };
 
   const addDocument = (doc: Omit<HealthDocument, 'id' | 'uploadedAt'>) => {
-    const newDoc: HealthDocument = {
-      ...doc,
-      id: `DOC-${Date.now().toString().slice(-4)}`,
-      uploadedAt: new Date().toISOString().split('T')[0]
-    };
-    setDocuments(prev => [newDoc, ...prev]);
+    setDocuments(prev => [
+      { ...doc, id: `DOC-${Date.now().toString().slice(-4)}`, uploadedAt: new Date().toISOString().split('T')[0] },
+      ...prev
+    ]);
   };
 
-  const addConsultation = (rec: Omit<ConsultationRecord, 'id' | 'date'>) => {
-    const newRecord: ConsultationRecord = {
-      ...rec,
-      id: `ENC-${Date.now().toString().slice(-4)}`,
-      date: new Date().toISOString().split('T')[0]
-    };
-    setConsultations(prev => [newRecord, ...prev]);
-  };
-
-  const bookAppointment = async (appt: Omit<Appointment, 'id' | 'status'>) => {
-    const newAppt: Appointment = {
-      ...appt,
-      id: `APT-${Date.now().toString().slice(-4)}`,
-      status: 'Confirmed'
-    };
-    setAppointments(prev => [newAppt, ...prev]);
-
+  const addConsultation = async (rec: any): Promise<{ ok: boolean; message: string }> => {
     const token = localStorage.getItem('uhr_jwt_token');
-    if (token) {
-      try {
-        await fetch('https://unified-health-record.onrender.com/api/appointments', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`
-          },
-          body: JSON.stringify({
-            doctorId: 1,
-            appointmentDate: appt.date,
-            appointmentTime: appt.time,
-            reason: appt.type
-          })
-        });
-      } catch (err) {
-        console.error('Booking sync failed:', err);
+    if (!token) return { ok: false, message: 'Not authenticated.' };
+
+    try {
+      const res = await fetch(`${API_BASE}/api/doctor/consultation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(rec)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return { ok: false, message: data.message || 'Failed to save consultation.' };
       }
+      await refreshData();
+      return { ok: true, message: data.message };
+    } catch {
+      return { ok: false, message: 'Network error connecting to server.' };
+    }
+  };
+
+  const bookAppointment = async (appt: Omit<Appointment, 'id' | 'status'>): Promise<{ ok: boolean; message: string }> => {
+    const token = localStorage.getItem('uhr_jwt_token');
+    if (!token) return { ok: false, message: 'Please log in as a patient first.' };
+
+    try {
+      const res = await fetch(`${API_BASE}/api/appointments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          doctorId: appt.doctorId,
+          appointmentDate: appt.date,
+          appointmentTime: appt.time,
+          reason: appt.type
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) return { ok: false, message: data.message || 'Booking failed.' };
+      await refreshData();
+      return { ok: true, message: data.message };
+    } catch {
+      return { ok: false, message: 'Network error booking appointment.' };
     }
   };
 
   const cancelAppointment = async (id: string) => {
-    setAppointments(prev => prev.map(a => a.id === id ? { ...a, status: 'Cancelled' } : a));
+    setAppointments(prev => prev.map(a => (a.id === id ? { ...a, status: 'Cancelled' } : a)));
     const token = localStorage.getItem('uhr_jwt_token');
     const numericId = id.replace('APT-', '');
     if (token) {
-      try {
-        await fetch(`https://unified-health-record.onrender.com/api/appointments/${numericId}/cancel`, {
-          method: 'PATCH',
-          headers: { Authorization: `Bearer ${token}` }
-        });
-      } catch (err) {
-        console.error('Cancel sync failed:', err);
-      }
+      await fetch(`${API_BASE}/api/appointments/${numericId}/cancel`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}` }
+      });
     }
   };
 
   const updateAppointmentStatus = (id: string, status: Appointment['status']) => {
-    setAppointments(prev => prev.map(a => a.id === id ? { ...a, status: 'Completed' } : a));
+    setAppointments(prev => prev.map(a => (a.id === id ? { ...a, status } : a)));
   };
 
-  const verifyDoctor = (id: string, status: DoctorUser['status']) => {};
+  const verifyDoctor = () => {};
 
   const logout = () => {
     localStorage.removeItem('uhr_jwt_token');
     localStorage.removeItem('uhr_user');
     setIsAuthenticated(false);
     setCurrentUser(null);
+    setProfile(emptyProfile);
+    setAppointments([]);
+    setConsultations([]);
+    setLabReports([]);
   };
 
   return (
@@ -467,6 +515,8 @@ export const HealthRecordProvider: React.FC<{ children: React.ReactNode }> = ({ 
         addDocument,
         doctors,
         auditLogs,
+        adminStats,
+        doctorStats,
         addConsultation,
         bookAppointment,
         cancelAppointment,
