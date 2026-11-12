@@ -71,7 +71,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
     const [userRes] = await conn.execute(
-      'INSERT INTO users (email, password_hash, role) VALUES (?, ?, "patient")',
+      'INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'patient')',
       [email.trim().toLowerCase(), passwordHash]
     );
     const userId = userRes.insertId;
@@ -222,7 +222,7 @@ app.post('/api/appointments', verifyToken, authorize('patient'), async (req, res
   }
   try {
     const [result] = await pool.execute(
-      'INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, reason, status) VALUES (?, ?, ?, ?, ?, "confirmed")',
+      'INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, reason, status) VALUES (?, ?, ?, ?, ?, 'confirmed')',
       [req.user.patientId, numericDoctorId, appointmentDate, appointmentTime, reason || 'General Consultation']
     );
     await logAudit(req.user.id, 'BOOK_APPOINTMENT', 'appointments', result.insertId);
@@ -234,7 +234,7 @@ app.post('/api/appointments', verifyToken, authorize('patient'), async (req, res
 
 app.patch('/api/appointments/:id/cancel', verifyToken, async (req, res) => {
   try {
-    await pool.execute('UPDATE appointments SET status = "cancelled" WHERE id = ?', [req.params.id]);
+    await pool.execute('UPDATE appointments SET status = 'cancelled' WHERE id = ?', [req.params.id]);
     await logAudit(req.user.id, 'CANCEL_APPOINTMENT', 'appointments', req.params.id);
     res.json({ message: 'Appointment cancelled.' });
   } catch (err) {
@@ -296,7 +296,7 @@ app.post('/api/doctor/patients', verifyToken, authorize('doctor', 'admin'), asyn
 
     const passwordHash = await bcrypt.hash(password, 10);
     const [userRes] = await conn.execute(
-      'INSERT INTO users (email, password_hash, role) VALUES (?, ?, "patient")',
+      'INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'patient')',
       [email.trim().toLowerCase(), passwordHash]
     );
 
@@ -486,7 +486,7 @@ app.post('/api/admin/doctors', verifyToken, authorize('admin'), async (req, res)
 
     const passwordHash = await bcrypt.hash(password, 10);
     const [userRes] = await conn.execute(
-      'INSERT INTO users (email, password_hash, role) VALUES (?, ?, "doctor")',
+      'INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'doctor')',
       [email.trim().toLowerCase(), passwordHash]
     );
 
@@ -714,12 +714,12 @@ app.listen(PORT, () => console.log(`Secure Healthcare Backend running at http://
       const patientPass = await bcrypt.hash('Patient@2026', 10);
 
       await pool.execute(
-        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, "admin", TRUE)',
+        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, 'admin', TRUE)',
         ['admin@uhrhospital.in', adminPass]
       );
 
       const [docUser] = await pool.execute(
-        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, "doctor", TRUE)',
+        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, 'doctor', TRUE)',
         ['doctor@uhrhospital.in', doctorPass]
       );
       await pool.execute(
@@ -729,7 +729,7 @@ app.listen(PORT, () => console.log(`Secure Healthcare Backend running at http://
       );
 
       const [patUser] = await pool.execute(
-        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, "patient", TRUE)',
+        'INSERT INTO users (email, password_hash, role, is_active) VALUES (?, ?, 'patient', TRUE)',
         ['patient@uhrhospital.in', patientPass]
       );
       await pool.execute(
