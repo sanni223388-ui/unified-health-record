@@ -74,8 +74,6 @@ function generateSixDigitCode() {
 
 const smtpUser = (process.env.SMTP_USER || '').trim();
 const smtpPass = (process.env.SMTP_PASS || '').trim();
-const brevoApiKey = (process.env.BREVO_API_KEY || '').trim();
-const brevoSenderEmail = (process.env.BREVO_SENDER_EMAIL || smtpUser).trim();
 const mailTransporter = smtpUser && smtpPass
   ? nodemailer.createTransport({
       host: 'smtp.gmail.com',
@@ -99,7 +97,6 @@ function smtpDiagnostic(error, eventId) {
     let redacted = value;
     if (smtpUser) redacted = redacted.replaceAll(smtpUser, '[redacted-smtp-user]');
     if (smtpPass) redacted = redacted.replaceAll(smtpPass, '[redacted-smtp-password]');
-    if (brevoApiKey) redacted = redacted.replaceAll(brevoApiKey, '[redacted-brevo-api-key]');
     return redacted;
   };
   return {
@@ -121,9 +118,17 @@ function sendOtpFailure(res, eventId) {
 }
 
 async function sendSecurityOtpEmail(toEmail, otpCode, purposeLabel) {
-  const subject = `Unified Health ${purposeLabel} verification code`;
-  const text = `Your Unified Health ${purposeLabel} verification code is ${otpCode}. It expires in 10 minutes.`;
-  const html = `
+  if (!mailTransporter) {
+    const error = new Error('SMTP is not configured');
+    error.code = 'SMTP_NOT_CONFIGURED';
+    throw error;
+  }
+  return mailTransporter.sendMail({
+    from: `"Unified Health Security (ABDM)" <${smtpUser}>`,
+    to: toEmail,
+    subject: `Unified Health ${purposeLabel} verification code`,
+    text: `Your Unified Health ${purposeLabel} verification code is ${otpCode}. It expires in 10 minutes.`,
+    html: `
       <div style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px;">
         <h2 style="color: #0d9488; margin-top: 0;">Unified Health Record • 2-Step Verification</h2>
         <p style="color: #334155; font-size: 14px;">Your 6-digit verification code for <strong>${purposeLabel}</strong> is:</p>
@@ -132,61 +137,16 @@ async function sendSecurityOtpEmail(toEmail, otpCode, purposeLabel) {
         </div>
         <p style="color: #64748b; font-size: 12px; margin-top: 16px;">Valid for 10 minutes. Protected under DPDP Act 2023 & ABDM Health Data Privacy Standards.</p>
       </div>
-    `;
-
-  if (brevoApiKey) {
-    if (!brevoSenderEmail) {
-      const error = new Error('Brevo sender email is not configured');
-      error.code = 'BREVO_SENDER_NOT_CONFIGURED';
-      throw error;
-    }
-    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
-      headers: {
-        'api-key': brevoApiKey,
-        'content-type': 'application/json'
-      },
-      signal: AbortSignal.timeout(20_000),
-      body: JSON.stringify({
-        sender: { name: 'Unified Health Security', email: brevoSenderEmail },
-        to: [{ email: toEmail }],
-        subject,
-        textContent: text,
-        htmlContent: html
-      })
-    });
-    if (!response.ok) {
-      const error = new Error(`Brevo API request failed with HTTP ${response.status}`);
-      error.code = 'BREVO_API_ERROR';
-      error.command = 'HTTPS';
-      error.responseCode = response.status;
-      throw error;
-    }
-    return;
-  }
-
-  if (!mailTransporter) {
-    const error = new Error('No email provider is configured');
-    error.code = 'EMAIL_PROVIDER_NOT_CONFIGURED';
-    throw error;
-  }
-  return mailTransporter.sendMail({
-    from: `"Unified Health Security (ABDM)" <${smtpUser}>`,
-    to: toEmail,
-    subject,
-    text,
-    html
+    `
   });
 }
 
-if (brevoApiKey) {
-  console.info('Brevo HTTPS email provider configured.');
-} else if (mailTransporter) {
+if (mailTransporter) {
   mailTransporter.verify()
     .then(() => console.info('SMTP verification succeeded.'))
     .catch((err) => console.error('SMTP verification failed:', smtpDiagnostic(err, 'startup')));
 } else {
-  console.error('Email verification skipped: configure BREVO_API_KEY or SMTP_USER and SMTP_PASS.');
+  console.error('SMTP verification skipped: SMTP_USER or SMTP_PASS is not configured.');
 }
 
 const verifyToken = (req, res, next) => {
@@ -227,7 +187,7 @@ app.get('/api/health', async (req, res) => {
     res.json({
       status: 'ok',
       hasAdmin: adminCount > 0,
-      email2faConfigured: Boolean(brevoApiKey || mailTransporter)
+      email2faConfigured: Boolean(mailTransporter)
     });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
