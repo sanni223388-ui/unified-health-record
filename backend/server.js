@@ -77,8 +77,11 @@ const smtpPass = (process.env.SMTP_PASS || '').trim();
 const mailTransporter = smtpUser && smtpPass
   ? nodemailer.createTransport({
       host: 'smtp.gmail.com',
-      port: 465,
-      secure: true,
+      // Port 587 starts plain then upgrades to encrypted TLS with STARTTLS.
+      // Render timed out before it could connect to Gmail's implicit-TLS port 465.
+      port: 587,
+      secure: false,
+      requireTLS: true,
       connectionTimeout: 15_000,
       greetingTimeout: 15_000,
       socketTimeout: 20_000,
