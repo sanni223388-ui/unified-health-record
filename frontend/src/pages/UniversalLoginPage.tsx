@@ -97,12 +97,16 @@ export const UniversalLoginPage: React.FC = () => {
       const res = await fetchWithWakeRetry(`${API_BASE}/api/auth/request-register-otp`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email })
+        body: JSON.stringify({
+          email,
+          accountType: mode === 'setup-admin' ? 'admin' : 'patient'
+        })
       });
       const data = await res.json();
       setServerStatus('online');
       if (!res.ok) {
-        setError(data.message || 'Could not send verification code.');
+        const reference = typeof data.eventId === 'string' ? ` Reference: ${data.eventId}` : '';
+        setError(`${data.message || 'Could not send verification code.'}${reference}`);
       } else {
         setOtpSent(true);
         setSuccessMsg(data.message);
