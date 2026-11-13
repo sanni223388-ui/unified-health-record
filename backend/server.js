@@ -7,7 +7,6 @@ const crypto = require('crypto');
 const dotenv = require('dotenv');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
 const pool = require('./config/db');
 
 dotenv.config();
@@ -72,31 +71,24 @@ function generateSixDigitCode() {
   return crypto.randomInt(100000, 1_000_000).toString();
 }
 
-const smtpUser = (process.env.SMTP_USER || '').trim();
-const smtpPass = (process.env.SMTP_PASS || '').trim();
-const mailTransporter = smtpUser && smtpPass
-  ? nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      // Port 587 starts plain then upgrades to encrypted TLS with STARTTLS.
-      // Render timed out before it could connect to Gmail's implicit-TLS port 465.
-      port: 587,
-      secure: false,
-      requireTLS: true,
-      connectionTimeout: 15_000,
-      greetingTimeout: 15_000,
-      socketTimeout: 20_000,
-      auth: { user: smtpUser, pass: smtpPass }
-    })
-  : null;
+const googleClientId = (process.env.GOOGLE_CLIENT_ID || '').trim();
+const googleClientSecret = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
+const googleRefreshToken = (process.env.GOOGLE_REFRESH_TOKEN || '').trim();
+const googleSenderEmail = (process.env.GOOGLE_SENDER_EMAIL || '').trim().toLowerCase();
+const gmailApiConfigured = Boolean(googleClientId && googleClientSecret && googleRefreshToken && googleSenderEmail);
+let googleAccessToken;
+let googleAccessTokenExpiresAt = 0;
 
-function smtpDiagnostic(error, eventId) {
+function emailDiagnostic(error, eventId) {
   // Keep provider details needed for Render troubleshooting, but never log a code,
-  // a recipient, or SMTP credentials.
+  // recipient, or OAuth secret.
   const redact = (value) => {
     if (typeof value !== 'string') return value;
     let redacted = value;
-    if (smtpUser) redacted = redacted.replaceAll(smtpUser, '[redacted-smtp-user]');
-    if (smtpPass) redacted = redacted.replaceAll(smtpPass, '[redacted-smtp-password]');
+    if (googleClientId) redacted = redacted.replaceAll(googleClientId, '[redacted-google-client-id]');
+    if (googleClientSecret) redacted = redacted.replaceAll(googleClientSecret, '[redacted-google-client-secret]');
+    if (googleRefreshToken) redacted = redacted.replaceAll(googleRefreshToken, '[redacted-google-refresh-token]');
+    if (googleAccessToken) redacted = redacted.replaceAll(googleAccessToken, '[redacted-google-access-token]');
     return redacted;
   };
   return {
@@ -110,6 +102,38 @@ function smtpDiagnostic(error, eventId) {
   };
 }
 
+async function getGoogleAccessToken() {
+  if (googleAccessToken && Date.now() < googleAccessTokenExpiresAt) return googleAccessToken;
+
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    signal: AbortSignal.timeout(20_000),
+    body: new URLSearchParams({
+      client_id: googleClientId,
+      client_secret: googleClientSecret,
+      refresh_token: googleRefreshToken,
+      grant_type: 'refresh_token'
+    })
+  });
+  if (!response.ok) {
+    const error = new Error(`Google OAuth token request failed with HTTP ${response.status}`);
+    error.code = 'GOOGLE_OAUTH_ERROR';
+    error.command = 'HTTPS';
+    error.responseCode = response.status;
+    throw error;
+  }
+  const payload = await response.json();
+  if (!payload.access_token || !payload.expires_in) {
+    const error = new Error('Google OAuth response did not contain an access token');
+    error.code = 'GOOGLE_OAUTH_INVALID_RESPONSE';
+    throw error;
+  }
+  googleAccessToken = payload.access_token;
+  googleAccessTokenExpiresAt = Date.now() + Math.max(0, Number(payload.expires_in) - 60) * 1000;
+  return googleAccessToken;
+}
+
 function sendOtpFailure(res, eventId) {
   return res.status(503).json({
     message: 'We could not send a verification code right now. Please try again shortly.',
@@ -118,17 +142,14 @@ function sendOtpFailure(res, eventId) {
 }
 
 async function sendSecurityOtpEmail(toEmail, otpCode, purposeLabel) {
-  if (!mailTransporter) {
-    const error = new Error('SMTP is not configured');
-    error.code = 'SMTP_NOT_CONFIGURED';
+  if (!gmailApiConfigured) {
+    const error = new Error('Gmail API is not configured');
+    error.code = 'GMAIL_API_NOT_CONFIGURED';
     throw error;
   }
-  return mailTransporter.sendMail({
-    from: `"Unified Health Security (ABDM)" <${smtpUser}>`,
-    to: toEmail,
-    subject: `Unified Health ${purposeLabel} verification code`,
-    text: `Your Unified Health ${purposeLabel} verification code is ${otpCode}. It expires in 10 minutes.`,
-    html: `
+  const subject = `Unified Health ${purposeLabel} verification code`;
+  const text = `Your Unified Health ${purposeLabel} verification code is ${otpCode}. It expires in 10 minutes.`;
+  const html = `
       <div style="font-family: Arial, sans-serif; max-width: 480px; margin: auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px;">
         <h2 style="color: #0d9488; margin-top: 0;">Unified Health Record • 2-Step Verification</h2>
         <p style="color: #334155; font-size: 14px;">Your 6-digit verification code for <strong>${purposeLabel}</strong> is:</p>
@@ -137,16 +158,53 @@ async function sendSecurityOtpEmail(toEmail, otpCode, purposeLabel) {
         </div>
         <p style="color: #64748b; font-size: 12px; margin-top: 16px;">Valid for 10 minutes. Protected under DPDP Act 2023 & ABDM Health Data Privacy Standards.</p>
       </div>
-    `
+    `;
+  const boundary = `uhr-${crypto.randomBytes(12).toString('hex')}`;
+  const rawMessage = [
+    `From: Unified Health Security <${googleSenderEmail}>`,
+    `To: <${toEmail}>`,
+    `Subject: ${subject}`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    text,
+    `--${boundary}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    html,
+    `--${boundary}--`,
+    ''
+  ].join('\r\n');
+  const accessToken = await getGoogleAccessToken();
+  const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      'content-type': 'application/json'
+    },
+    signal: AbortSignal.timeout(20_000),
+    body: JSON.stringify({ raw: Buffer.from(rawMessage).toString('base64url') })
   });
+  if (!response.ok) {
+    const error = new Error(`Gmail API send request failed with HTTP ${response.status}`);
+    error.code = 'GMAIL_API_SEND_ERROR';
+    error.command = 'HTTPS';
+    error.responseCode = response.status;
+    throw error;
+  }
 }
 
-if (mailTransporter) {
-  mailTransporter.verify()
-    .then(() => console.info('SMTP verification succeeded.'))
-    .catch((err) => console.error('SMTP verification failed:', smtpDiagnostic(err, 'startup')));
+if (gmailApiConfigured) {
+  getGoogleAccessToken()
+    .then(() => console.info('Gmail HTTPS API authentication succeeded.'))
+    .catch((err) => console.error('Gmail HTTPS API authentication failed:', emailDiagnostic(err, 'startup')));
 } else {
-  console.error('SMTP verification skipped: SMTP_USER or SMTP_PASS is not configured.');
+  console.error('Gmail HTTPS API is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, and GOOGLE_SENDER_EMAIL.');
 }
 
 const verifyToken = (req, res, next) => {
@@ -187,7 +245,7 @@ app.get('/api/health', async (req, res) => {
     res.json({
       status: 'ok',
       hasAdmin: adminCount > 0,
-      email2faConfigured: Boolean(mailTransporter)
+      email2faConfigured: gmailApiConfigured
     });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
