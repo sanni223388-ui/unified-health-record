@@ -8,6 +8,7 @@
     "gmail:authorize": "node scripts/generate-gmail-refresh-token.js"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "bcryptjs": "^2.4.3",
     "canvas-confetti": "^1.9.4",
     "clsx": "^2.1.1",
