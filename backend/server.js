@@ -86,7 +86,7 @@ app.post('/api/auth/register', async (req, res) => {
     if (roleToCreate === 'patient') {
       const uhrId = generateUHRId();
       await conn.execute(
-        `INSERT INTO patients (user_id, uhr_id, full_name, date_of_birth, gender, blood_group, phone, address, allergies) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO patients (user_id, uhr_id, full_name, date_of_birth, gender, blood_group, phone, address, allergies, consent_pin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '0000')`,
         [userId, uhrId, fullName, dob || '2000-01-01', gender || 'other', bloodGroup || 'O+', phone || '', address || '', allergies || '']
       );
     }
