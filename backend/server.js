@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const dotenv = require('dotenv');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const pool = require('./config/db');
 
 dotenv.config();
@@ -156,7 +157,6 @@ app.get('/api/patient/dashboard', verifyToken, authorize('patient'), async (req,
   }
 });
 
-// Patient edits personal details (Strictly no medical edits)
 app.put('/api/patient/profile', verifyToken, authorize('patient'), async (req, res) => {
   const { phone, address, allergies } = req.body;
   try {
@@ -167,7 +167,6 @@ app.put('/api/patient/profile', verifyToken, authorize('patient'), async (req, r
   }
 });
 
-// Patient uploads own lab report
 app.post('/api/patient/reports', verifyToken, authorize('patient'), async (req, res) => {
   const { testName, laboratoryName, resultSummary } = req.body;
   try {
@@ -204,13 +203,11 @@ app.get('/api/doctor/dashboard', verifyToken, authorize('doctor'), async (req, r
   }
 });
 
-// Doctor can ONLY look up patient IF there is an active appointment (Consent via Booking)
 app.get('/api/doctor/patient/:uhr_id', verifyToken, authorize('doctor'), async (req, res) => {
   try {
     const [patients] = await pool.execute('SELECT * FROM patients WHERE uhr_id = ?', [req.params.uhr_id]);
     if (patients.length === 0) return res.status(404).json({ message: 'Patient not found.' });
     
-    // Privacy Check
     const [access] = await pool.execute('SELECT id FROM appointments WHERE patient_id = ? AND doctor_id = ? LIMIT 1', [patients[0].id, req.user.doctorId]);
     if (access.length === 0) return res.status(403).json({ message: 'Access Denied: You cannot view this patient without an active appointment/consent.' });
 
@@ -254,7 +251,6 @@ app.post('/api/admin/doctors', verifyToken, authorize('admin'), async (req, res)
 
 app.delete('/api/admin/doctors/:id', verifyToken, authorize('admin'), async (req, res) => {
   try {
-    // Delete user entirely (cascade deletes doctor profile)
     const [doc] = await pool.execute('SELECT user_id FROM doctors WHERE id = ?', [req.params.id]);
     if(doc.length > 0) {
        await pool.execute('DELETE FROM users WHERE id = ?', [doc[0].user_id]);
@@ -265,14 +261,42 @@ app.delete('/api/admin/doctors/:id', verifyToken, authorize('admin'), async (req
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// --- AURA MEDICAL AI CHATBOT ROUTE ---
+app.post('/api/chat', verifyToken, async (req, res) => {
+  try {
+    const { message } = req.body;
+    
+    if (!process.env.GEMINI_API_KEY) {
+      return res.json({ reply: 'Aura AI is currently offline. Missing API Key.' });
+    }
+
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    
+    const prompt = `You are Aura Clinical AI, a professional medical assistant for the Unified Health Record (UHR) system. 
+    Answer the following medical query safely, accurately, and concisely. 
+    Use plain text. DO NOT use markdown formatting like asterisks (**). 
+    Always add a brief, polite disclaimer advising them to consult their registered doctor for an official diagnosis.
+    
+    User Query: ${message}`;
+    
+    const result = await model.generateContent(prompt);
+    const replyText = result.response.text().replace(/\*/g, ''); 
+    
+    res.json({ reply: replyText });
+  } catch (err) {
+    console.error("Aura AI Error:", err);
+    res.status(500).json({ reply: 'Aura AI connection error. Please try again later.' });
+  }
+});
+
 // --- AUTO MIGRATE DB SCHEMA ---
 (async () => {
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(191) NOT NULL UNIQUE, password_hash VARCHAR(255) NOT NULL, role ENUM('patient', 'doctor', 'admin') NOT NULL, is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS patients (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL UNIQUE, uhr_id VARCHAR(50) UNIQUE, full_name VARCHAR(150), date_of_birth DATE, gender VARCHAR(20), blood_group VARCHAR(10), phone VARCHAR(20), address TEXT, allergies TEXT, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB`);
-    // Ensure uhr_id exists if table already existed
+    await pool.query(`CREATE TABLE IF NOT EXISTS patients (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL UNIQUE, uhr_id VARCHAR(50) UNIQUE, full_name VARCHAR(150), date_of_birth DATE, gender VARCHAR(20), blood_group VARCHAR(10), phone VARCHAR(20), address TEXT, allergies TEXT, consent_pin VARCHAR(4), FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB`);
     try { await pool.query('ALTER TABLE patients ADD COLUMN uhr_id VARCHAR(50) UNIQUE'); } catch(e){}
-    console.log('✅ Streamlined Production schema ready (No 2FA, Unique IDs active).');
+    console.log('✅ Streamlined Production schema ready.');
   } catch (err) { console.error('DB init error:', err.message); }
 })();
 
