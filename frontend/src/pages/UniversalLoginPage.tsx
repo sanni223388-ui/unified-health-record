@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useHealthRecord } from '../context/HealthRecordContext';
 import { Activity, ShieldCheck, Lock, Mail, ArrowRight, UserCheck, Stethoscope, Crown, AlertCircle, CheckCircle2, UserPlus, User } from 'lucide-react';
-import confetti from 'canvas-confetti';
 
 const API_BASE = 'https://unified-health-record.onrender.com';
 
@@ -58,8 +57,7 @@ export const UniversalLoginPage: React.FC = () => {
         setCurrentUser(data.user);
         setActiveRole(data.user.role);
         setIsAuthenticated(true);
-        confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
-      }
+              }
     } catch (err: any) {
       setError(err.message || 'Server error. Try again.');
     } finally {
