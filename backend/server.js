@@ -46,7 +46,7 @@ function generateUHRId() {
 // --- HEALTH & SYSTEM STATUS ---
 app.get('/api/health', async (req, res) => {
   try {
-    const [[{ adminCount }]] = await pool.query('SELECT COUNT(*) AS adminCount FROM users WHERE role = "admin"');
+    const [[{ adminCount }]] = await pool.query(`SELECT COUNT(*) AS adminCount FROM users WHERE role = 'admin'`);
     res.json({ status: 'ok', hasAdmin: adminCount > 0 });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
@@ -69,7 +69,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     let roleToCreate = 'patient';
     if (accountType === 'admin') {
-      const [[{ adminCount }]] = await conn.execute('SELECT COUNT(*) AS adminCount FROM users WHERE role = "admin"');
+      const [[{ adminCount }]] = await conn.execute(`SELECT COUNT(*) AS adminCount FROM users WHERE role = 'admin'`);
       if (adminCount > 0) {
         await conn.rollback();
         return res.status(403).json({ message: 'Only ONE Hospital Admin is allowed globally.' });
@@ -171,7 +171,7 @@ app.post('/api/patient/reports', verifyToken, authorize('patient'), async (req, 
   const { testName, laboratoryName, resultSummary } = req.body;
   try {
     await pool.execute(
-      'INSERT INTO lab_reports (patient_id, test_name, test_type, test_date, laboratory_name, result_summary, document_url) VALUES (?, ?, "Patient Upload", CURDATE(), ?, ?, "user-uploaded")',
+      `INSERT INTO lab_reports (patient_id, test_name, test_type, test_date, laboratory_name, result_summary, document_url) VALUES (?, ?, 'Patient Upload', CURDATE(), ?, ?, 'user-uploaded')`,
       [req.user.patientId, testName, laboratoryName, resultSummary]
     );
     res.json({ message: 'Report added successfully.' });
@@ -183,7 +183,7 @@ app.post('/api/patient/reports', verifyToken, authorize('patient'), async (req, 
 app.post('/api/appointments', verifyToken, authorize('patient'), async (req, res) => {
   const { doctorId, appointmentDate, appointmentTime, reason } = req.body;
   try {
-    await pool.execute('INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, reason, status) VALUES (?, ?, ?, ?, ?, "confirmed")', [req.user.patientId, doctorId, appointmentDate, appointmentTime, reason]);
+    await pool.execute(`INSERT INTO appointments (patient_id, doctor_id, appointment_date, appointment_time, reason, status) VALUES (?, ?, ?, ?, ?, 'confirmed')`, [req.user.patientId, doctorId, appointmentDate, appointmentTime, reason]);
     res.json({ message: 'Appointment confirmed.' });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -221,7 +221,7 @@ app.get('/api/doctor/patient/:uhr_id', verifyToken, authorize('doctor'), async (
 app.post('/api/doctor/consultation', verifyToken, authorize('doctor'), async (req, res) => {
   const { patientId, diagnosis, treatmentPlan } = req.body;
   try {
-    await pool.execute('INSERT INTO medical_records (patient_id, doctor_id, record_date, diagnosis, symptoms, clinical_notes, treatment_plan) VALUES (?, ?, CURDATE(), ?, "", "", ?)', [patientId, req.user.doctorId, diagnosis, treatmentPlan]);
+    await pool.execute(`INSERT INTO medical_records (patient_id, doctor_id, record_date, diagnosis, symptoms, clinical_notes, treatment_plan) VALUES (?, ?, CURDATE(), ?, '', '', ?)`, [patientId, req.user.doctorId, diagnosis, treatmentPlan]);
     res.json({ message: 'Medical record added securely.' });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -242,8 +242,8 @@ app.post('/api/admin/doctors', verifyToken, authorize('admin'), async (req, res)
   try {
     await conn.beginTransaction();
     const passHash = await bcrypt.hash(password, 10);
-    const [u] = await conn.execute('INSERT INTO users (email, password_hash, role) VALUES (?, ?, "doctor")', [email, passHash]);
-    await conn.execute('INSERT INTO doctors (user_id, full_name, specialization, license_number, hospital_affiliation, phone) VALUES (?, ?, ?, ?, "UHR Hospital", "")', [u.insertId, fullName, specialization, licenseNumber]);
+    const [u] = await conn.execute(`INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'doctor')`, [email, passHash]);
+    await conn.execute(`INSERT INTO doctors (user_id, full_name, specialization, license_number, hospital_affiliation, phone) VALUES (?, ?, ?, ?, 'UHR Hospital', '')`, [u.insertId, fullName, specialization, licenseNumber]);
     await conn.commit();
     res.json({ message: 'Real Doctor added successfully.' });
   } catch (err) { await conn.rollback(); res.status(500).json({ message: err.message }); } finally { conn.release(); }
