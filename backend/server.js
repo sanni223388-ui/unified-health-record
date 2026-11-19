@@ -275,7 +275,7 @@ app.post('/api/chat', verifyToken, async (req, res) => {
 
 User Query: ${message}`;
 
-    const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+    const models = ['gemini-3.8-flash', 'gemini-2.5-flash'];
     let lastError = '';
 
     for (const modelName of models) {
