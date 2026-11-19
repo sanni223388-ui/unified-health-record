@@ -265,28 +265,42 @@ app.delete('/api/admin/doctors/:id', verifyToken, authorize('admin'), async (req
 app.post('/api/chat', verifyToken, async (req, res) => {
   try {
     const { message } = req.body;
-    
-    if (!process.env.GEMINI_API_KEY) {
-      return res.json({ reply: 'Aura AI is currently offline. Missing API Key.' });
+    const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+
+    if (!apiKey) {
+      return res.json({ reply: 'Aura AI is offline: GEMINI_API_KEY is missing in Render.' });
     }
 
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    
-    const prompt = `You are Aura Clinical AI, a professional medical assistant for the Unified Health Record (UHR) system. 
-    Answer the following medical query safely, accurately, and concisely. 
-    Use plain text. DO NOT use markdown formatting like asterisks (**). 
-    Always add a brief, polite disclaimer advising them to consult their registered doctor for an official diagnosis.
-    
-    User Query: ${message}`;
-    
-    const result = await model.generateContent(prompt);
-    const replyText = result.response.text().replace(/\*/g, ''); 
-    
-    res.json({ reply: replyText });
+    const prompt = `You are Aura Clinical AI, a professional medical assistant for the Unified Health Record (UHR) system. Answer the following medical query safely, accurately, and concisely in plain text (no markdown asterisks). Always end with a brief disclaimer advising them to consult their registered doctor.
+
+User Query: ${message}`;
+
+    const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+    let lastError = '';
+
+    for (const modelName of models) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }]
+        })
+      });
+
+      const data = await response.json();
+      if (response.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+        const replyText = data.candidates[0].content.parts[0].text.replace(/\*/g, '');
+        return res.json({ reply: replyText });
+      }
+      lastError = data?.error?.message || `HTTP ${response.status}`;
+    }
+
+    console.error('Aura AI Error:', lastError);
+    res.status(500).json({ reply: `Aura AI Error: ${lastError}` });
   } catch (err) {
-    console.error("Aura AI Error:", err);
-    res.status(500).json({ reply: 'Aura AI connection error. Please try again later.' });
+    console.error('Aura AI Error:', err);
+    res.status(500).json({ reply: `Aura AI Error: ${err.message}` });
   }
 });
 
